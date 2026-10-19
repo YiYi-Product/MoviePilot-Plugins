@@ -3,11 +3,12 @@
     "name": "YiYi Media",
     "description": "与 YiYi Media 双向配对授权，自动添加 Emby 媒体服务器。",
     "labels": "媒体服务器,YiYi",
-    "version": "1.0.0",
+    "version": "1.0.1",
     "icon": "Emby_A.png",
     "author": "YiYi-Product",
     "level": 1,
     "history": {
+      "v1.0.1": "优化配置布局：顶部连接状态、响应式双列输入、独立折叠的解除绑定区域。",
       "v1.0.0": "支持一次性配对、独立双向授权、自动添加媒体服务器与撤销绑定。"
     }
   }

@@ -35,7 +35,7 @@ class YiYiMedia(_PluginBase):
     plugin_name = "YiYi Media"
     plugin_desc = "双向配对授权并自动添加 YiYi Media 媒体服务器。"
     plugin_icon = "Emby_A.png"
-    plugin_version = "1.0.0"
+    plugin_version = "1.0.1"
     plugin_author = "YiYi-Product"
     author_url = "https://github.com/YiYi-Product"
     plugin_config_prefix = "yiyimedia_"
@@ -326,18 +326,73 @@ class YiYiMedia(_PluginBase):
             raise IntegrationError(f"远端请求未成功（{status}），请检查地址、配对码及网络")
 
     def get_form(self) -> Tuple[List[dict], Dict[str, Any]]:
-        """仅展示用户输入和脱敏状态，不回填持久化的集成凭据"""
+        """分组展示连接配置，仅返回脱敏状态和用户输入字段"""
+        status = self.get_data("status") or "尚未配对"
+        paired = bool((self.get_data(STATE_KEY) or {}).get("connection_id"))
+        connected = status == "双向连接成功"
+        field_props = {"variant": "outlined", "density": "comfortable", "persistent-hint": True}
         return [
-            {"component": "VAlert", "props": {"type": "info", "variant": "tonal", "text":
-                "在 YiYi 系统设置生成配对码，再填写地址并保存。MoviePilot 回调地址须能被 YiYi 访问；"
-                "留空使用 APP_DOMAIN。配对后自动添加 Emby 媒体服务器，每分钟检查连接。"}},
-            {"component": "VSwitch", "props": {"model": "enabled", "label": "启用插件"}},
-            {"component": "VTextField", "props": {"model": "yiyi_url", "label": "YiYi 站点地址"}},
-            {"component": "VTextField", "props": {"model": "pairing_code", "label": "一次性配对码（5分钟有效）", "type": "password"}},
-            {"component": "VTextField", "props": {"model": "callback_url", "label": "MoviePilot 回调地址（选填）"}},
-            {"component": "VTextField", "props": {"model": "server_name", "label": "媒体服务器名称"}},
-            {"component": "VSwitch", "props": {"model": "disconnect", "label": "解除双方绑定（保存后执行）"}},
-            {"component": "VAlert", "props": {"type": "info", "text": self.get_data("status") or "尚未配对"}},
+            {"component": "VForm", "content": [
+                {"component": "VAlert", "props": {
+                    "type": "success" if connected else "info", "variant": "tonal", "density": "compact",
+                    "class": "mb-5 rounded-lg", "title": status,
+                    "text": "媒体服务器已自动添加，每分钟检查连接。" if connected else
+                            "首次连接：在 YiYi 生成配对码，填写下方地址和配对码，启用后保存。",
+                }},
+                {"component": "VSwitch", "props": {
+                    "model": "enabled", "label": "启用插件", "color": "primary", "inset": True,
+                    "hide-details": True, "class": "mb-4",
+                }},
+                {"component": "VCard", "props": {
+                    "title": "连接设置", "variant": "flat", "class": "mb-5 rounded-lg border",
+                }, "content": [{"component": "VCardText", "props": {"class": "pt-4"}, "content": [
+                    {"component": "VRow", "content": [
+                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                            {"component": "VTextField", "props": {
+                                **field_props, "model": "yiyi_url", "label": "YiYi 站点地址",
+                                "placeholder": "https://media.example.com",
+                                "hint": "填写 YiYi 管理站点入口，无需添加 API 路径。",
+                            }},
+                        ]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                            {"component": "VTextField", "props": {
+                                **field_props, "model": "pairing_code", "label": "一次性配对码",
+                                "type": "password", "autocomplete": "new-password",
+                                "placeholder": "已配对，无需再次填写" if paired else "填写 YiYi 生成的配对码",
+                                "hint": "已配对，保持留空即可；重新配对时才需填写。" if paired else
+                                        "在 YiYi 的 MoviePilot 集成页生成，5 分钟内有效。",
+                            }},
+                        ]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                            {"component": "VTextField", "props": {
+                                **field_props, "model": "callback_url", "label": "MoviePilot 回调地址（选填）",
+                                "placeholder": "https://moviepilot.example.com",
+                                "hint": "填写 YiYi 能访问的 MoviePilot 入口，留空使用已配置的站点域名。",
+                            }},
+                        ]},
+                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                            {"component": "VTextField", "props": {
+                                **field_props, "model": "server_name", "label": "媒体服务器名称",
+                                "placeholder": "YiYi Media", "hint": "首次添加到 MoviePilot 的媒体服务器名称。",
+                            }},
+                        ]},
+                    ]},
+                ]}]},
+                {"component": "VExpansionPanels", "props": {"variant": "accordion"}, "content": [
+                    {"component": "VExpansionPanel", "props": {
+                        "title": "连接管理 · 解除绑定", "elevation": 0, "class": "border rounded-lg",
+                    }, "content": [{"component": "VExpansionPanelText", "content": [
+                        {"component": "VAlert", "props": {
+                            "type": "warning", "variant": "tonal", "density": "compact", "class": "mb-3",
+                            "text": "解除后将撤销双方授权，并停用插件创建的媒体服务器。重新连接需要新的配对码。",
+                        }},
+                        {"component": "VSwitch", "props": {
+                            "model": "disconnect", "label": "解除双方绑定（保存后执行）", "color": "error",
+                            "inset": True, "hide-details": True,
+                        }},
+                    ]}]},
+                ]},
+            ]},
         ], {"enabled": False, "yiyi_url": "", "pairing_code": "", "callback_url": "", "server_name": "YiYi Media", "disconnect": False}
 
     def get_page(self) -> List[dict]:
