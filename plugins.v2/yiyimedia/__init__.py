@@ -35,7 +35,7 @@ class YiYiMedia(_PluginBase):
     plugin_name = "YiYi Media"
     plugin_desc = "双向配对授权并自动添加 YiYi Media 媒体服务器。"
     plugin_icon = "Emby_A.png"
-    plugin_version = "1.0.1"
+    plugin_version = "1.0.2"
     plugin_author = "YiYi-Product"
     author_url = "https://github.com/YiYi-Product"
     plugin_config_prefix = "yiyimedia_"
@@ -171,12 +171,18 @@ class YiYiMedia(_PluginBase):
             self._require_ok(info)
             if not info.json().get("Id"):
                 raise IntegrationError("YiYi Emby 查询入口返回无效服务器信息")
+            # 直接读取系统名称；Emby 协议名称可能带后缀或独立覆盖配置。
+            branding = self._request("GET", base + "/api/auth/branding")
+            self._require_ok(branding)
+            name = branding.json().get("systemName")
+            if not isinstance(name, str) or not name.strip():
+                raise IntegrationError("未能获取 YiYi 系统名称，稍后自动重试")
             if not self._current(generation):
                 return
             with self._state_lock:
                 if not self._current(generation):
                     return
-                self._upsert_server(state, server_url)
+                self._upsert_server(state, server_url, name.strip())
             result = self._request("POST", base + API_BASE + "/client/" + state["connection_id"] + "/activate",
                                    key=state["access_key"])
             self._require_ok(result)
@@ -234,17 +240,15 @@ class YiYiMedia(_PluginBase):
             self.update_config(self._config)
         return state
 
-    def _upsert_server(self, state: dict, server_url: str):
+    def _upsert_server(self, state: dict, server_url: str, name: str):
         servers = copy.deepcopy(self.systemconfig.get(SystemConfigKey.MediaServers) or [])
         marker = state["instance_id"]
         managed = [s for s in servers if s.get("config", {}).get("yiyi_instance_id") == marker]
-        name = managed[0]["name"] if managed else str(self._config.get("server_name") or "YiYi Media").strip()
-        if not name:
-            name = "YiYi Media"
-        if not managed and any(s.get("name") == name for s in servers):
+        other_names = {s.get("name") for s in servers if s.get("config", {}).get("yiyi_instance_id") != marker}
+        if name in other_names:
             name += " (" + marker[:8] + ")"
-        if not managed and any(s.get("name") == name for s in servers):
-            raise IntegrationError("媒体服务器名称冲突，请修改插件中的名称")
+        if name in other_names:
+            raise IntegrationError("自动生成的媒体服务器名称已被占用，请修改同名的其它媒体服务器名称")
         server = copy.deepcopy(managed[0]) if managed else {}
         server.update({"name": name, "type": "emby", "enabled": True})
         server["config"] = {**server.get("config", {}), "host": server_url,
@@ -363,20 +367,18 @@ class YiYiMedia(_PluginBase):
                                         "在 YiYi 的 MoviePilot 集成页生成，5 分钟内有效。",
                             }},
                         ]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
+                        {"component": "VCol", "props": {"cols": 12}, "content": [
                             {"component": "VTextField", "props": {
                                 **field_props, "model": "callback_url", "label": "MoviePilot 回调地址（选填）",
                                 "placeholder": "https://moviepilot.example.com",
                                 "hint": "填写 YiYi 能访问的 MoviePilot 入口，留空使用已配置的站点域名。",
                             }},
                         ]},
-                        {"component": "VCol", "props": {"cols": 12, "md": 6}, "content": [
-                            {"component": "VTextField", "props": {
-                                **field_props, "model": "server_name", "label": "媒体服务器名称",
-                                "placeholder": "YiYi Media", "hint": "首次添加到 MoviePilot 的媒体服务器名称。",
-                            }},
-                        ]},
                     ]},
+                    {"component": "VAlert", "props": {
+                        "type": "info", "variant": "tonal", "density": "compact", "class": "mt-3",
+                        "text": "媒体服务器名称自动读取 YiYi 的「系统名称」，修改后也会自动同步，无需填写。",
+                    }},
                 ]}]},
                 {"component": "VExpansionPanels", "props": {"variant": "accordion"}, "content": [
                     {"component": "VExpansionPanel", "props": {
@@ -393,7 +395,7 @@ class YiYiMedia(_PluginBase):
                     ]}]},
                 ]},
             ]},
-        ], {"enabled": False, "yiyi_url": "", "pairing_code": "", "callback_url": "", "server_name": "YiYi Media", "disconnect": False}
+        ], {"enabled": False, "yiyi_url": "", "pairing_code": "", "callback_url": "", "disconnect": False}
 
     def get_page(self) -> List[dict]:
         """展示当前连接状态"""

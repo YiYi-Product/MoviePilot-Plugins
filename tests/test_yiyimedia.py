@@ -20,7 +20,9 @@ def successful_request(method, url, key=None, payload=None):
     if url.endswith("/exchange"):
         return response({"connectionId": CONNECTION_ID, "protocolVersion": 1})
     if url.endswith("/Info"):
-        return response({"Id": "yiyi-server-1"})
+        return response({"Id": "yiyi-server-1", "ServerName": "YiYi Media"})
+    if url.endswith("/branding"):
+        return response({"systemName": "YiYi"})
     return response({"success": True})
 
 
@@ -48,6 +50,7 @@ def test_pair_creates_one_server_and_survives_restart(plugin, plugin_module, mon
     assert plugin.servers[0] == original
     assert plugin.servers[1]["config"]["host"].endswith("/server/" + CONNECTION_ID)
     assert plugin.servers[1]["config"]["apikey"] == state["access_key"]
+    assert plugin.servers[1]["name"] == "YiYi"
     assert plugin.get_data("status") == "双向连接成功"
     assert len(plugin.events) == 1
     plugin.servers[1]["sync_libraries"] = ["library-7"]
@@ -86,12 +89,84 @@ def test_lost_exchange_response_reuses_persisted_keys(plugin, monkeypatch):
 
 def test_name_collision_does_not_replace_user_server(plugin, monkeypatch):
     """默认名称被占用时新增独立名称"""
-    existing = {"name": "YiYi Media", "type": "emby", "enabled": True, "config": {"host": "https://other.example.com"}}
+    existing = {"name": "YiYi", "type": "emby", "enabled": True, "config": {"host": "https://other.example.com"}}
     plugin.servers = [copy.deepcopy(existing)]
     install_request(monkeypatch, plugin)
     plugin.synchronize()
     assert plugin.servers[0] == existing
-    assert plugin.servers[1]["name"].startswith("YiYi Media (")
+    assert plugin.servers[1]["name"].startswith("YiYi (")
+
+
+def test_system_name_updates_existing_server_and_preserves_settings(plugin, monkeypatch):
+    """升级旧配置或系统更名时更新原记录，保留同步设置和其它服务器"""
+    plugin._config["server_name"] = "旧的手工名称"
+    calls = install_request(monkeypatch, plugin)
+    plugin.synchronize()
+    assert plugin.servers[0]["name"] == "YiYi"
+    assert all(key is None for _, url, key, _ in calls if url.endswith("/branding"))
+    plugin.servers[0].update({"name": "旧的手工名称", "sync_libraries": ["library-7"], "sync_interval": 90})
+    existing = {"name": "家庭影院", "type": "emby", "enabled": True, "config": {"host": "https://other.example.com"}}
+    plugin.servers.insert(0, copy.deepcopy(existing))
+    before = copy.deepcopy(plugin.servers[1])
+    state = plugin.get_data("connection")
+
+    def request(method, url, key=None, payload=None):
+        if url.endswith("/branding"):
+            return response({"systemName": " 家庭影院 "})
+        return successful_request(method, url, key, payload)
+
+    monkeypatch.setattr(plugin, "_request", request)
+    plugin.synchronize()
+    expected = {**before, "name": "家庭影院 (" + state["instance_id"][:8] + ")"}
+    assert plugin.servers == [existing, expected]
+    assert plugin.get_data("connection") == state
+    plugin.events.clear()
+    plugin.synchronize()
+    assert plugin.events == []
+
+
+@pytest.mark.parametrize("branding_response", [
+    None, response(status=503), response({}), response({"systemName": "  "}), response({"systemName": 42}),
+])
+def test_missing_system_name_preserves_server_and_retries(plugin, monkeypatch, branding_response):
+    """名称读取失败不创建默认服务器，也不覆盖已保存的服务器或丢弃授权"""
+    install_request(monkeypatch, plugin)
+    plugin.synchronize()
+    state = plugin.get_data("connection")
+    servers = copy.deepcopy(plugin.servers)
+
+    def request(method, url, key=None, payload=None):
+        if url.endswith("/branding"):
+            return branding_response
+        return successful_request(method, url, key, payload)
+
+    monkeypatch.setattr(plugin, "_request", request)
+    plugin.synchronize()
+    assert plugin.servers == servers
+    assert plugin.get_data("connection") == state
+    assert plugin.get_data("status") != "双向连接成功"
+    plugin.servers = []
+    plugin.synchronize()
+    assert plugin.servers == []
+    install_request(monkeypatch, plugin)
+    plugin.synchronize()
+    assert plugin.servers[0]["name"] == "YiYi"
+
+
+def test_generated_name_collision_preserves_all_servers(plugin, monkeypatch):
+    """自动后缀名称仍被占用时停止更新，不覆盖用户服务器"""
+    install_request(monkeypatch, plugin)
+    plugin.synchronize()
+    marker = plugin.get_data("instance_id")
+    plugin.servers[0]["name"] = "旧名称"
+    plugin.servers.extend([
+        {"name": "YiYi", "config": {}},
+        {"name": "YiYi (" + marker[:8] + ")", "config": {}},
+    ])
+    before = copy.deepcopy(plugin.servers)
+    plugin.synchronize()
+    assert plugin.servers == before
+    assert "名称已被占用" in plugin.get_data("status")
 
 
 def test_revoked_authorization_disables_only_managed_server(plugin, monkeypatch):
@@ -108,7 +183,7 @@ def test_revoked_authorization_disables_only_managed_server(plugin, monkeypatch)
     assert not plugin.config["enabled"]
 
 
-@pytest.mark.parametrize("during", ["/status", "/Info", "/activate"])
+@pytest.mark.parametrize("during", ["/status", "/Info", "/branding", "/activate"])
 def test_disconnect_during_sync_cannot_restore_old_keys(plugin, monkeypatch, during):
     """检查期间收到解除回调时，在途任务不能重新启用服务器"""
     install_request(monkeypatch, plugin)
