@@ -306,3 +306,261 @@ def test_old_authorized_callback_cannot_disconnect_a_new_binding(plugin, monkeyp
         plugin.disconnect(old)
     assert error.value.status_code == 401
     assert plugin.get_data("connection")["connection_id"] == CONNECTION_ID
+
+
+def test_subscribe_endpoints_create_attach_query_and_cancel(plugin, plugin_module, monkeypatch):
+    """协议 v2 回调支持创建订阅、幂等关联已有订阅、批量查进度与取消订阅，且拒绝未授权请求"""
+    install_request(monkeypatch, plugin)
+    plugin.synchronize()
+    key = plugin.get_data("connection")["callback_key"]
+    app = FastAPI()
+    for api in plugin.get_api():
+        api = dict(api)
+        api.pop("allow_anonymous")
+        app.add_api_route(**api)
+
+    with TestClient(app) as client:
+        ping = client.get("/ping", headers={"X-YiYi-Integration-Key": key})
+        assert ping.status_code == 200
+        assert ping.json()["protocolVersion"] == 3
+        assert "subscribe" in ping.json()["capabilities"]
+        assert "download" in ping.json()["capabilities"]
+
+        assert client.post("/subscribes", json={"mediaType": "TV", "tmdbId": 1399, "title": "权力的游戏", "season": 2}).status_code == 401
+
+        created = client.post(
+            "/subscribes",
+            headers={"X-YiYi-Integration-Key": key},
+            json={"requestId": 77, "mediaType": "TV", "tmdbId": 1399, "title": "权力的游戏", "year": 2012, "season": 2, "bestVersion": True, "username": "alice"},
+        )
+        assert created.status_code == 200
+        body = created.json()
+        assert body["success"] is True
+        assert body["action"] == "CREATED"
+        sub_id = body["mpSubscribeId"]
+        assert body["totalEpisode"] == 12
+        assert body["lackEpisode"] == 4
+        assert plugin_module._test_doubles.subscribe_calls[0]["best_version"] == 1
+
+        # 重复推送同一部剧同一季，直接幂等挂载，不再调 SubscribeChain.add
+        attached = client.post(
+            "/subscribes",
+            headers={"X-YiYi-Integration-Key": key},
+            json={"requestId": 78, "mediaType": "TV", "tmdbId": 1399, "title": "权力的游戏", "season": 2},
+        )
+        assert attached.status_code == 200
+        assert attached.json()["action"] == "ATTACHED"
+        assert attached.json()["mpSubscribeId"] == sub_id
+        assert len(plugin_module._test_doubles.subscribe_calls) == 1
+
+        queried = client.post(
+            "/subscribes/query",
+            headers={"X-YiYi-Integration-Key": key},
+            json={"mpSubscribeIds": [sub_id, 99999]},
+        )
+        assert queried.status_code == 200
+        items = queried.json()["items"]
+        assert items[0] == {"mpSubscribeId": sub_id, "exists": True, "state": "R", "totalEpisode": 12, "lackEpisode": 4}
+        assert items[1]["exists"] is False
+        assert items[1]["state"] == "NOT_FOUND"
+
+        cancelled = client.post(
+            "/subscribes/cancel",
+            headers={"X-YiYi-Integration-Key": key},
+            json={"mpSubscribeId": sub_id},
+        )
+        assert cancelled.status_code == 200
+        assert cancelled.json() == {"success": True, "removed": True}
+        assert plugin_module._test_doubles.subscribes_store == {}
+
+
+def test_subscribe_complete_event_pushes_callback_to_yiyi(plugin, plugin_module, monkeypatch):
+    """MoviePilot 订阅完成事件携带访问凭据回推 YiYi，并脱敏清理本地跟踪"""
+    calls = install_request(monkeypatch, plugin)
+    plugin.synchronize()
+    auth = plugin.verify_integration_key(plugin.get_data("connection")["callback_key"])
+    created = plugin.create_subscribe(
+        {"requestId": 88, "mediaType": "TV", "tmdbId": 94997, "title": "龙之家族", "season": 1},
+        auth,
+    )
+    sub_id = created["mpSubscribeId"]
+    calls.clear()
+
+    event = plugin_module._test_doubles.Event(
+        plugin_module._test_doubles.EventType.SubscribeComplete,
+        {"subscribe_id": sub_id, "subscribe_info": {"id": sub_id, "tmdbid": 94997, "type": "电视剧", "season": 1, "total_episode": 10}},
+    )
+    plugin.on_subscribe_event(event)
+
+    assert len(calls) == 1
+    method, url, key, payload = calls[0]
+    assert method == "POST"
+    assert url.endswith(f"/client/{CONNECTION_ID}/subscribes/events")
+    assert key == plugin.get_data("connection")["access_key"]
+    assert payload == {
+        "eventType": "COMPLETED",
+        "mpSubscribeId": sub_id,
+        "requestId": 88,
+        "mediaType": "TV",
+        "tmdbId": 94997,
+        "season": 1,
+        "state": "COMPLETED",
+        "totalEpisode": 10,
+        "lackEpisode": 0,
+    }
+
+
+def test_subscribe_error_message_redacts_sensitive_tokens(plugin, plugin_module, monkeypatch):
+    """上游返回含密钥或 URL 的错误文本时自动脱敏"""
+    install_request(monkeypatch, plugin)
+    plugin.synchronize()
+    auth = plugin.verify_integration_key(plugin.get_data("connection")["callback_key"])
+    plugin_module._test_doubles.SubscribeChain.fail_message = "TMDB api_key=secret123 failed at https://internal.local"
+    try:
+        result = plugin.create_subscribe({"mediaType": "MOVIE", "tmdbId": 550, "title": "搏击俱乐部"}, auth)
+        assert result["success"] is False
+        assert "secret123" not in result["message"]
+        assert "https://" not in result["message"]
+    finally:
+        plugin_module._test_doubles.SubscribeChain.fail_message = None
+
+
+def test_download_search_and_selected_download_strip_credentials_and_match_missing(plugin, plugin_module, monkeypatch):
+    """协议 v3 检索脱敏返回候选种子（不泄露站点 Cookie 与种子 Passkey），支持手动选种与整季按缺失集下载"""
+    install_request(monkeypatch, plugin)
+    plugin.synchronize()
+    key = plugin.get_data("connection")["callback_key"]
+
+    ctx_other = SimpleNamespace(
+        torrent_info=SimpleNamespace(
+            site_name="SiteB", title="Game.of.Thrones.S02E01.1080p", description="ep1",
+            site_cookie="SECRET_COOKIE_B", site_ua="SECRET_UA",
+            enclosure="https://pt.example.com/download?passkey=SECRET_PASSKEY_1",
+            page_url="https://pt.example.com/details.php?id=1",
+            size=2_000_000_000, seeders=100, peers=5, grabs=50,
+            pubdate="2026-10-01", volume_factor="普通", hit_and_run=False, labels=["中字"], pri_order=10,
+        ),
+        meta_info=SimpleNamespace(
+            season_list=[2], episode_list=[1], season_episode="S02E01",
+            resource_pix="1080p", edition="WEB-DL", video_encode="H264", audio_encode="AAC", resource_team="TEAMB",
+        ),
+    )
+    ctx_match = SimpleNamespace(
+        torrent_info=SimpleNamespace(
+            site_name="MTeam", title="Game.of.Thrones.S02E03.2160p.HDR", description="ep3 免费",
+            site_cookie="SECRET_COOKIE_A", site_ua="SECRET_UA",
+            enclosure="https://pt.example.com/download?passkey=SECRET_PASSKEY_2",
+            page_url="https://pt.example.com/details.php?id=2",
+            size=4_500_000_000, seeders=42, peers=3, grabs=120,
+            pubdate="2026-10-02", volume_factor="免费", hit_and_run=False, labels=["HDR", "中字"], pri_order=50,
+        ),
+        meta_info=SimpleNamespace(
+            season_list=[2], episode_list=[3], season_episode="S02E03",
+            resource_pix="2160p", edition="WEB-DL", video_encode="H265", audio_encode="DDP5.1", resource_team="HHWEB",
+        ),
+    )
+    ctx_pack = SimpleNamespace(
+        torrent_info=SimpleNamespace(
+            site_name="HDSky", title="Game.of.Thrones.S02.Complete.2160p", description="全季合集",
+            site_cookie="SECRET_COOKIE_C", site_ua="SECRET_UA",
+            enclosure="https://pt.example.com/download?passkey=SECRET_PASSKEY_3",
+            size=45_000_000_000, seeders=88, peers=10, grabs=300,
+            pubdate="2026-10-03", volume_factor="2X免费", hit_and_run=True, labels=["合集"], pri_order=30,
+        ),
+        meta_info=SimpleNamespace(
+            season_list=[2], episode_list=[], season_episode="S02",
+            resource_pix="2160p", edition="BluRay", video_encode="H265", audio_encode="Atmos", resource_team="HDS",
+        ),
+    )
+    plugin_module._test_doubles.search_contexts[:] = [ctx_other, ctx_match, ctx_pack]
+
+    app = FastAPI()
+    for api in plugin.get_api():
+        api = dict(api)
+        api.pop("allow_anonymous")
+        app.add_api_route(**api)
+
+    with TestClient(app) as client:
+        assert client.post("/downloads/search", json={"mediaType": "TV", "tmdbId": 1399, "season": 2}).status_code == 401
+
+        res = client.post(
+            "/downloads/search",
+            headers={"X-YiYi-Integration-Key": key},
+            json={"mediaType": "TV", "tmdbId": 1399, "title": "权力的游戏", "season": 2, "episodes": [3, 7]},
+        )
+        assert res.status_code == 200
+        assert "SECRET_COOKIE" not in res.text
+        assert "SECRET_PASSKEY" not in res.text
+        assert "SECRET_UA" not in res.text
+        body = res.json()
+        assert body["success"] is True
+        assert body["totalCount"] == 3
+        # 整季合集覆盖 [3, 7]（2 集）排第一，其次 S02E03（1 集），最后不命中的 S02E01
+        assert body["items"][0]["wholeSeason"] is True
+        assert body["items"][0]["matchesMissing"] is True
+        assert body["items"][0]["matchedEpisodes"] == [3, 7]
+        assert body["items"][1]["matchedEpisodes"] == [3]
+        assert body["items"][2]["matchesMissing"] is False
+
+        # 手动挑选整季包，并指定只下载缺失集 [3, 7]
+        dl = client.post(
+            "/downloads",
+            headers={"X-YiYi-Integration-Key": key},
+            json={
+                "mode": "SELECTED",
+                "searchToken": body["searchToken"],
+                "candidateId": body["items"][0]["candidateId"],
+                "episodes": [3, 7],
+                "username": "admin",
+            },
+        )
+        assert dl.status_code == 200
+        dl_body = dl.json()
+        assert dl_body["success"] is True
+        assert dl_body["action"] == "DOWNLOADED"
+        assert dl_body["downloadedCount"] == 1
+        assert plugin_module._test_doubles.download_single_calls[-1]["episodes"] == {3, 7}
+        assert plugin_module._test_doubles.download_single_calls[-1]["context"] is ctx_pack
+
+        # 解除绑定后旧搜索会话立即失效
+        assert client.post("/disconnect", headers={"X-YiYi-Integration-Key": key}).status_code == 200
+        assert plugin._search_cache == {}
+
+
+def test_download_auto_mode_uses_batch_download_and_reports_remaining_episodes(plugin, plugin_module, monkeypatch):
+    """协议 v3 AUTO 模式按缺失集调用 SearchChain + DownloadChain.batch_download 并回传剩余缺失集"""
+    install_request(monkeypatch, plugin)
+    plugin.synchronize()
+    auth = plugin.verify_integration_key(plugin.get_data("connection")["callback_key"])
+
+    ctx = SimpleNamespace(
+        torrent_info=SimpleNamespace(title="Show.S02E03.2160p.WEB-DL"),
+        meta_info=SimpleNamespace(season_list=[2], episode_list=[3]),
+    )
+    plugin_module._test_doubles.search_contexts[:] = [ctx]
+    plugin_module._test_doubles.DownloadChain.batch_downloaded_override = [ctx]
+    plugin_module._test_doubles.DownloadChain.batch_lefts = {
+        1399: {2: plugin_module._test_doubles.NotExistMediaInfo(season=2, episodes=[7], total_episode=10, start_episode=3)}
+    }
+
+    res = plugin.trigger_download(
+        {"mode": "AUTO", "mediaType": "TV", "tmdbId": 1399, "title": "权力的游戏", "season": 2, "episodes": [3, 7], "totalEpisode": 10, "username": "admin"},
+        auth,
+    )
+    assert res["success"] is True
+    assert res["action"] == "DOWNLOADED"
+    assert res["downloadedCount"] == 1
+    assert res["downloadedTitles"] == ["Show.S02E03.2160p.WEB-DL"]
+    assert res["remainingEpisodes"] == [7]
+    call = plugin_module._test_doubles.batch_download_calls[-1]
+    assert call["no_exists"][1399][2].episodes == [3, 7]
+
+    # 无结果时返回 NO_RESULTS 并保留缺失集列表
+    plugin_module._test_doubles.search_contexts[:] = []
+    empty_res = plugin.trigger_download(
+        {"mode": "AUTO", "mediaType": "TV", "tmdbId": 1399, "title": "权力的游戏", "season": 2, "episodes": [7]},
+        auth,
+    )
+    assert empty_res["success"] is False
+    assert empty_res["action"] == "NO_RESULTS"
+    assert empty_res["remainingEpisodes"] == [7]

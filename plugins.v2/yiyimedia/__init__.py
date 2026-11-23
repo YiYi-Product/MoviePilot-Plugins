@@ -1,4 +1,4 @@
-"""YiYi Media 与 MoviePilot 的双向配对插件"""
+"""YiYi Media 与 MoviePilot 的双向配对与求片订阅插件"""
 
 import copy
 import hashlib
@@ -12,17 +12,55 @@ from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
 from apscheduler.schedulers.background import BackgroundScheduler
-from fastapi import Depends, Header, HTTPException
+from fastapi import Body, Depends, Header, HTTPException
 
+from app.chain.subscribe import SubscribeChain
 from app.core.config import settings
+from app.core.event import Event, eventmanager
 from app.log import logger
 from app.plugins import _PluginBase
 from app.schemas import ConfigChangeEventData
-from app.schemas.types import EventType, SystemConfigKey
+from app.schemas.types import EventType, MediaType, SystemConfigKey
 from app.utils.http import RequestUtils
+
+try:
+    from app.chain.search import SearchChain
+except ImportError:  # pragma: no cover - 兼容精简宿主环境
+    SearchChain = None
+
+try:
+    from app.chain.download import DownloadChain
+except ImportError:  # pragma: no cover - 兼容精简宿主环境
+    DownloadChain = None
+
+try:
+    from app.schemas import NotExistMediaInfo
+except ImportError:  # pragma: no cover - 兼容旧版 schemas 导出路径
+    try:
+        from app.schemas.mediaserver import NotExistMediaInfo
+    except ImportError:
+        NotExistMediaInfo = None
+
+try:
+    from app.utils.media import build_media_key, resolve_media_identity
+except ImportError:  # pragma: no cover - 兼容旧版 MoviePilot v2（键为 int tmdbid）
+    build_media_key = None
+    resolve_media_identity = None
+
+try:
+    from app.db.subscribe_oper import SubscribeOper
+except ImportError:  # pragma: no cover - 兼容不同 MoviePilot 宿主模块路径
+    from app.db.oper.subscribe import SubscribeOper
 
 API_BASE = "/api/media/integrations/moviepilot"
 STATE_KEY = "connection"
+SUBSCRIPTIONS_KEY = "subscriptions"
+PROTOCOL_VERSION = 3
+CAPABILITIES = ["media_server", "subscribe", "download"]
+MAX_TRACKED_SUBSCRIPTIONS = 2000
+MAX_SEARCH_SESSIONS = 32
+SEARCH_SESSION_TTL_SECONDS = 900
+MAX_SEARCH_RESULTS = 100
 
 
 class IntegrationError(ValueError):
@@ -30,12 +68,12 @@ class IntegrationError(ValueError):
 
 
 class YiYiMedia(_PluginBase):
-    """管理独立集成凭据和插件创建的媒体服务器，不改动其它服务器"""
+    """管理独立集成凭据、插件创建的媒体服务器与求片订阅/缺集补全下载联动，不改动其它服务器"""
 
     plugin_name = "YiYi Media"
-    plugin_desc = "双向配对授权并自动添加 YiYi Media 媒体服务器。"
+    plugin_desc = "双向配对授权、自动添加 YiYi Media 媒体服务器并联动处理求片订阅与缺集直接下载。"
     plugin_icon = "Emby_A.png"
-    plugin_version = "1.0.2"
+    plugin_version = "1.2.0"
     plugin_author = "YiYi-Product"
     author_url = "https://github.com/YiYi-Product"
     plugin_config_prefix = "yiyimedia_"
@@ -50,6 +88,7 @@ class YiYiMedia(_PluginBase):
         self._lock = threading.Lock()
         self._state_lock = threading.RLock()
         self._generation = 0
+        self._search_cache: Dict[str, Dict[str, Any]] = {}
 
     def init_plugin(self, config: Optional[dict] = None):
         """延后建立连接，确保插件回调路由已完成注册"""
@@ -89,11 +128,46 @@ class YiYiMedia(_PluginBase):
             """仅解除本次鉴权所对应的绑定"""
             return self.disconnect(authorization)
 
+        def create_subscribe_callback(payload: Dict[str, Any] = Body(...),
+                                      authorization=Depends(self.verify_integration_key)):
+            """按已验证连接创建或幂等关联 MoviePilot 订阅"""
+            return self.create_subscribe(payload, authorization)
+
+        def query_subscribes_callback(payload: Dict[str, Any] = Body(...),
+                                      authorization=Depends(self.verify_integration_key)):
+            """批量读取关联订阅的当前状态与剩余集数"""
+            return self.query_subscribes(payload, authorization)
+
+        def cancel_subscribe_callback(payload: Dict[str, Any] = Body(...),
+                                      authorization=Depends(self.verify_integration_key)):
+            """取消指定的 MoviePilot 订阅"""
+            return self.cancel_subscribe(payload, authorization)
+
+        def search_downloads_callback(payload: Dict[str, Any] = Body(...),
+                                      authorization=Depends(self.verify_integration_key)):
+            """按 TMDB ID 与季/集检索候选资源，返回脱敏列表并缓存会话句柄"""
+            return self.search_downloads(payload, authorization)
+
+        def trigger_download_callback(payload: Dict[str, Any] = Body(...),
+                                      authorization=Depends(self.verify_integration_key)):
+            """触发 MoviePilot 直接下载（支持 AUTO 自动优选补全与 SELECTED 手动选种下载）"""
+            return self.trigger_download(payload, authorization)
+
         return [
             {"path": "/ping", "endpoint": ping_callback, "methods": ["GET"],
              "summary": "YiYi 双向连通验证", "allow_anonymous": True},
             {"path": "/disconnect", "endpoint": disconnect_callback, "methods": ["POST"],
              "summary": "YiYi 解除配对", "allow_anonymous": True},
+            {"path": "/subscribes", "endpoint": create_subscribe_callback, "methods": ["POST"],
+             "summary": "YiYi 创建或关联求片订阅", "allow_anonymous": True},
+            {"path": "/subscribes/query", "endpoint": query_subscribes_callback, "methods": ["POST"],
+             "summary": "YiYi 批量查询订阅进度", "allow_anonymous": True},
+            {"path": "/subscribes/cancel", "endpoint": cancel_subscribe_callback, "methods": ["POST"],
+             "summary": "YiYi 取消求片订阅", "allow_anonymous": True},
+            {"path": "/downloads/search", "endpoint": search_downloads_callback, "methods": ["POST"],
+             "summary": "YiYi 检索可下载候选资源", "allow_anonymous": True},
+            {"path": "/downloads", "endpoint": trigger_download_callback, "methods": ["POST"],
+             "summary": "YiYi 直接触发 MoviePilot 下载", "allow_anonymous": True},
         ]
 
     def verify_integration_key(self, key: Optional[str] = Header(default=None, alias="X-YiYi-Integration-Key")):
@@ -107,12 +181,16 @@ class YiYiMedia(_PluginBase):
             return self._generation, state["connection_id"]
 
     def ping(self, authorization: Optional[tuple] = None) -> dict:
-        """只返回连接标识，不返回配置或凭据"""
+        """只返回连接标识与能力声明，不返回配置或凭据"""
         with self._state_lock:
             self._validate_callback(authorization)
             state = self.get_data(STATE_KEY) or {}
-            return {"instanceId": state.get("instance_id"), "connectionId": state.get("connection_id"),
-                    "protocolVersion": 1}
+            return {
+                "instanceId": state.get("instance_id"),
+                "connectionId": state.get("connection_id"),
+                "protocolVersion": PROTOCOL_VERSION,
+                "capabilities": list(CAPABILITIES),
+            }
 
     def disconnect(self, authorization: Optional[tuple] = None) -> dict:
         """先让在途同步无法恢复旧授权，再清理插件管理的服务器"""
@@ -121,6 +199,651 @@ class YiYiMedia(_PluginBase):
             self._validate_callback(authorization)
             self._clear_binding("双方授权已解除")
             return {"success": True}
+
+    def create_subscribe(self, payload: Optional[Dict[str, Any]], authorization: Optional[tuple] = None) -> dict:
+        """通过 MoviePilot SubscribeChain 创建订阅；若同片同季已存在则直接幂等挂载"""
+        with self._state_lock:
+            self._validate_callback(authorization)
+        data = payload if isinstance(payload, dict) else {}
+        media_kind = str(data.get("mediaType") or "").strip().upper()
+        if media_kind not in ("MOVIE", "TV"):
+            raise HTTPException(status_code=400, detail="不支持的媒体类型")
+        tmdb_id = self._positive_int(data.get("tmdbId"), "tmdbId")
+        title = str(data.get("title") or "").strip()
+        if not title or len(title) > 512:
+            raise HTTPException(status_code=400, detail="媒体标题无效")
+        season = self._positive_int(data.get("season"), "season") if media_kind == "TV" else None
+        year_val = data.get("year")
+        year = str(year_val).strip() if year_val not in (None, "") else ""
+        if year and not re.fullmatch(r"[0-9]{4}", year):
+            year = ""
+        best_version = 1 if bool(data.get("bestVersion")) else 0
+        request_id = data.get("requestId")
+        tracked_request_id = int(request_id) if isinstance(request_id, int) and request_id > 0 else None
+        username = str(data.get("username") or "").strip()[:64] or "YiYi Media"
+
+        oper = SubscribeOper()
+        existing = self._find_existing_subscribe(oper, media_kind, tmdb_id, season)
+        if existing is not None:
+            sub_id = int(getattr(existing, "id"))
+            self._remember_subscription(sub_id, tracked_request_id, media_kind, tmdb_id, season)
+            return {
+                "success": True,
+                "action": "ATTACHED",
+                "mpSubscribeId": sub_id,
+                "state": str(getattr(existing, "state", "") or "R"),
+                "totalEpisode": self._optional_int(getattr(existing, "total_episode", None)),
+                "lackEpisode": self._optional_int(getattr(existing, "lack_episode", None)),
+                "message": "已关联 MoviePilot 中已存在的同款订阅",
+            }
+
+        mtype = MediaType.TV if media_kind == "TV" else MediaType.MOVIE
+        try:
+            sid, err_msg = SubscribeChain().add(
+                mtype=mtype,
+                title=title,
+                year=year,
+                tmdbid=tmdb_id,
+                season=season,
+                best_version=best_version,
+                exist_ok=True,
+                username=username,
+            )
+        except Exception:
+            return {"success": False, "action": "FAILED", "message": "MoviePilot 执行添加订阅时发生内部异常"}
+
+        resolved = oper.get(int(sid)) if sid else self._find_existing_subscribe(oper, media_kind, tmdb_id, season)
+        resolved_id = int(sid) if sid else (int(getattr(resolved, "id")) if resolved is not None else None)
+        if resolved_id is None:
+            return {
+                "success": False,
+                "action": "FAILED",
+                "message": self._sanitize_message(err_msg) or "MoviePilot 未能识别或创建该订阅",
+            }
+        self._remember_subscription(resolved_id, tracked_request_id, media_kind, tmdb_id, season)
+        return {
+            "success": True,
+            "action": "CREATED" if sid else "ATTACHED",
+            "mpSubscribeId": resolved_id,
+            "state": str(getattr(resolved, "state", "") or "R") if resolved is not None else "R",
+            "totalEpisode": self._optional_int(getattr(resolved, "total_episode", None)) if resolved is not None else None,
+            "lackEpisode": self._optional_int(getattr(resolved, "lack_episode", None)) if resolved is not None else None,
+            "message": self._sanitize_message(err_msg) or "已创建 MoviePilot 订阅",
+        }
+
+    def query_subscribes(self, payload: Optional[Dict[str, Any]], authorization: Optional[tuple] = None) -> dict:
+        """按 MoviePilot 订阅 ID 列表批量返回状态"""
+        with self._state_lock:
+            self._validate_callback(authorization)
+        data = payload if isinstance(payload, dict) else {}
+        raw_ids = data.get("mpSubscribeIds")
+        if not isinstance(raw_ids, list) or len(raw_ids) > 200:
+            raise HTTPException(status_code=400, detail="mpSubscribeIds 必须是长度不超过 200 的数组")
+        oper = SubscribeOper()
+        items = []
+        for raw_id in raw_ids:
+            sub_id = self._positive_int(raw_id, "mpSubscribeId")
+            sub = oper.get(sub_id)
+            if sub is None:
+                items.append({
+                    "mpSubscribeId": sub_id,
+                    "exists": False,
+                    "state": "NOT_FOUND",
+                    "totalEpisode": None,
+                    "lackEpisode": None,
+                })
+            else:
+                items.append({
+                    "mpSubscribeId": sub_id,
+                    "exists": True,
+                    "state": str(getattr(sub, "state", "") or "R"),
+                    "totalEpisode": self._optional_int(getattr(sub, "total_episode", None)),
+                    "lackEpisode": self._optional_int(getattr(sub, "lack_episode", None)),
+                })
+        return {"items": items}
+
+    def cancel_subscribe(self, payload: Optional[Dict[str, Any]], authorization: Optional[tuple] = None) -> dict:
+        """按 MoviePilot 订阅 ID 取消订阅（若已不存在则幂等成功）"""
+        with self._state_lock:
+            self._validate_callback(authorization)
+        data = payload if isinstance(payload, dict) else {}
+        sub_id = self._positive_int(data.get("mpSubscribeId"), "mpSubscribeId")
+        oper = SubscribeOper()
+        existing = oper.get(sub_id)
+        if existing is not None:
+            oper.delete(sub_id)
+        self._forget_subscription(sub_id)
+        return {"success": True, "removed": existing is not None}
+
+    def search_downloads(self, payload: Optional[Dict[str, Any]], authorization: Optional[tuple] = None) -> dict:
+        """检索匹配 TMDB ID 与季/集的候选种子，仅返回脱敏摘要并缓存完整上下文于本机内存"""
+        with self._state_lock:
+            self._validate_callback(authorization)
+            state = self.get_data(STATE_KEY) or {}
+            scope_key = (self._generation, state.get("connection_id"))
+        if SearchChain is None:
+            return {"success": False, "action": "UNSUPPORTED", "searchToken": None, "totalCount": 0, "items": [],
+                    "message": "当前 MoviePilot 运行环境不支持资源检索链"}
+
+        data = payload if isinstance(payload, dict) else {}
+        media_kind = str(data.get("mediaType") or "TV").strip().upper()
+        if media_kind not in ("MOVIE", "TV"):
+            raise HTTPException(status_code=400, detail="不支持的媒体类型")
+        tmdb_id = self._positive_int(data.get("tmdbId"), "tmdbId")
+        season = self._positive_int(data.get("season"), "season") if media_kind == "TV" else None
+        missing_episodes = self._parse_episodes(data.get("episodes"))
+        keyword_filter = str(data.get("keyword") or "").strip().lower()
+        mtype = MediaType.TV if media_kind == "TV" else MediaType.MOVIE
+
+        try:
+            contexts = self._search_contexts(mtype=mtype, tmdb_id=tmdb_id, season=season, missing_episodes=None,
+                                             total_episode=None)
+        except Exception:
+            return {"success": False, "action": "SEARCH_FAILED", "searchToken": None, "totalCount": 0, "items": [],
+                    "message": "MoviePilot 执行资源检索时发生异常，请查看 MoviePilot 日志"}
+
+        entries: List[Tuple[dict, Any]] = []
+        missing_set = set(missing_episodes)
+        for ctx in contexts or []:
+            torrent = getattr(ctx, "torrent_info", None)
+            if torrent is None:
+                continue
+            title = self._sanitize_text(getattr(torrent, "title", "") or "", 300)
+            description = self._sanitize_text(getattr(torrent, "description", "") or "", 300)
+            site_name = self._sanitize_text(getattr(torrent, "site_name", "") or "", 64)
+            if keyword_filter:
+                haystack = f"{title} {description} {site_name}".lower()
+                if keyword_filter not in haystack:
+                    continue
+            meta = getattr(ctx, "meta_info", None)
+            ep_list = self._parse_episodes(getattr(meta, "episode_list", None))
+            season_list = self._parse_episodes(getattr(meta, "season_list", None))
+            if media_kind == "TV" and season is not None and season_list and season not in season_list:
+                continue
+            whole_season = media_kind == "TV" and not ep_list
+            if missing_set:
+                if whole_season:
+                    matched_eps = list(missing_episodes)
+                    matches_missing = True
+                else:
+                    matched_eps = sorted(missing_set.intersection(ep_list))
+                    matches_missing = bool(matched_eps)
+            else:
+                matched_eps = list(ep_list)
+                matches_missing = True
+
+            raw_labels = getattr(torrent, "labels", None) or []
+            labels = [self._sanitize_text(str(lbl), 32) for lbl in raw_labels if str(lbl).strip()][:10]
+            item_summary = {
+                "siteName": site_name,
+                "title": title,
+                "description": description,
+                "size": int(float(getattr(torrent, "size", 0) or 0)),
+                "seeders": self._optional_int(getattr(torrent, "seeders", 0)) or 0,
+                "peers": self._optional_int(getattr(torrent, "peers", 0)) or 0,
+                "grabs": self._optional_int(getattr(torrent, "grabs", 0)) or 0,
+                "pubdate": self._sanitize_text(str(getattr(torrent, "pubdate", "") or ""), 40),
+                "volumeFactor": self._sanitize_text(str(getattr(torrent, "volume_factor", "") or ""), 32),
+                "hitAndRun": bool(getattr(torrent, "hit_and_run", False)),
+                "labels": labels,
+                "seasonEpisode": self._sanitize_text(str(getattr(meta, "season_episode", "") or ""), 48),
+                "episodes": ep_list[:200],
+                "wholeSeason": whole_season,
+                "resolution": self._sanitize_text(str(getattr(meta, "resource_pix", "") or ""), 32),
+                "edition": self._sanitize_text(str(getattr(meta, "edition", "") or ""), 48),
+                "videoEncode": self._sanitize_text(str(getattr(meta, "video_encode", "") or ""), 32),
+                "audioEncode": self._sanitize_text(str(getattr(meta, "audio_encode", "") or ""), 32),
+                "resourceTeam": self._sanitize_text(str(getattr(meta, "resource_team", "") or ""), 48),
+                "priOrder": self._optional_int(getattr(torrent, "pri_order", 0)) or 0,
+                "matchesMissing": matches_missing,
+                "matchedEpisodes": matched_eps[:200],
+            }
+            entries.append((item_summary, ctx))
+
+        entries.sort(
+            key=lambda pair: (
+                1 if pair[0]["matchesMissing"] else 0,
+                len(pair[0]["matchedEpisodes"]),
+                pair[0]["priOrder"],
+                pair[0]["seeders"],
+            ),
+            reverse=True,
+        )
+        entries = entries[:MAX_SEARCH_RESULTS]
+
+        search_token = secrets.token_urlsafe(24)
+        candidate_map: Dict[str, Any] = {}
+        items: List[dict] = []
+        for idx, (summary, ctx) in enumerate(entries):
+            cid = str(idx)
+            summary["candidateId"] = cid
+            candidate_map[cid] = ctx
+            items.append(summary)
+
+        self._store_search_session(search_token, scope_key, media_kind, tmdb_id, season, candidate_map)
+        msg = f"检索到 {len(items)} 条候选资源" if items else "未在已启用的站点中检索到可用资源"
+        return {
+            "success": True,
+            "action": "SEARCHED",
+            "searchToken": search_token,
+            "totalCount": len(items),
+            "items": items,
+            "message": msg,
+        }
+
+    def trigger_download(self, payload: Optional[Dict[str, Any]], authorization: Optional[tuple] = None) -> dict:
+        """直接调用 MoviePilot DownloadChain 推送下载：支持 SELECTED（选种）与 AUTO（自动搜源补全）"""
+        with self._state_lock:
+            self._validate_callback(authorization)
+            state = self.get_data(STATE_KEY) or {}
+            scope_key = (self._generation, state.get("connection_id"))
+        if DownloadChain is None:
+            return {"success": False, "action": "UNSUPPORTED", "mode": "AUTO", "downloadedCount": 0,
+                    "downloadedTitles": [], "remainingEpisodes": [],
+                    "message": "当前 MoviePilot 运行环境不支持直接下载链"}
+
+        data = payload if isinstance(payload, dict) else {}
+        mode = str(data.get("mode") or "AUTO").strip().upper()
+        if mode not in ("AUTO", "SELECTED"):
+            raise HTTPException(status_code=400, detail="mode 必须为 AUTO 或 SELECTED")
+        username = str(data.get("username") or "").strip()[:64] or "YiYi Media"
+
+        if mode == "SELECTED":
+            search_token = str(data.get("searchToken") or "").strip()
+            candidate_id = str(data.get("candidateId") or "").strip()
+            if not search_token or not candidate_id:
+                raise HTTPException(status_code=400, detail="SELECTED 模式必须提供 searchToken 与 candidateId")
+            session = self._get_search_session(search_token, scope_key)
+            if session is None:
+                return {"success": False, "action": "SESSION_EXPIRED", "mode": "SELECTED",
+                        "downloadedCount": 0, "downloadedTitles": [], "remainingEpisodes": [],
+                        "message": "候选资源列表已过期，请重新搜索后再点击下载"}
+            ctx = session["candidates"].get(candidate_id)
+            if ctx is None:
+                raise HTTPException(status_code=404, detail="指定的候选资源不存在")
+            requested_eps = self._parse_episodes(data.get("episodes"))
+            ep_set = set(requested_eps) if (session["media_kind"] == "TV" and requested_eps) else None
+            try:
+                raw_did = DownloadChain().download_single(
+                    context=ctx,
+                    episodes=ep_set,
+                    username=username,
+                    source="YiYi Media",
+                )
+            except Exception:
+                return {"success": False, "action": "FAILED", "mode": "SELECTED",
+                        "downloadedCount": 0, "downloadedTitles": [], "remainingEpisodes": requested_eps,
+                        "message": "MoviePilot 提交下载任务失败，请检查下载器配置与日志"}
+            did = raw_did[0] if isinstance(raw_did, tuple) else raw_did
+            err_detail = raw_did[1] if (isinstance(raw_did, tuple) and len(raw_did) > 1) else ""
+            torrent = getattr(ctx, "torrent_info", None)
+            title = self._sanitize_text(getattr(torrent, "title", "") or "", 200) or "候选资源"
+            if did:
+                return {
+                    "success": True,
+                    "action": "DOWNLOADED",
+                    "mode": "SELECTED",
+                    "downloadedCount": 1,
+                    "downloadedTitles": [title],
+                    "remainingEpisodes": [],
+                    "message": f"已推送至 MoviePilot 下载：{title}",
+                }
+            return {
+                "success": False,
+                "action": "FAILED",
+                "mode": "SELECTED",
+                "downloadedCount": 0,
+                "downloadedTitles": [],
+                "remainingEpisodes": requested_eps,
+                "message": self._sanitize_message(err_detail) or "MoviePilot 未能添加该下载任务（可能已存在或下载器拒绝）",
+            }
+
+        # AUTO 模式：自动搜源 + 按缺失集择优推送下载
+        if SearchChain is None:
+            return {"success": False, "action": "UNSUPPORTED", "mode": "AUTO", "downloadedCount": 0,
+                    "downloadedTitles": [], "remainingEpisodes": [],
+                    "message": "当前 MoviePilot 运行环境不支持自动检索链"}
+        media_kind = str(data.get("mediaType") or "TV").strip().upper()
+        if media_kind not in ("MOVIE", "TV"):
+            raise HTTPException(status_code=400, detail="不支持的媒体类型")
+        tmdb_id = self._positive_int(data.get("tmdbId"), "tmdbId")
+        season = self._positive_int(data.get("season"), "season") if media_kind == "TV" else None
+        missing_episodes = self._parse_episodes(data.get("episodes"))
+        total_episode = self._optional_int(data.get("totalEpisode"))
+        mtype = MediaType.TV if media_kind == "TV" else MediaType.MOVIE
+
+        try:
+            search_chain = SearchChain()
+            mediainfo = search_chain.recognize_media(mtype=mtype, tmdbid=tmdb_id) if hasattr(search_chain, "recognize_media") else None
+            no_exists = self._build_no_exists(media_kind, tmdb_id, season, missing_episodes, total_episode, mediainfo=mediainfo)
+            if mediainfo is not None and hasattr(search_chain, "process"):
+                contexts = search_chain.process(mediainfo=mediainfo, no_exists=no_exists) or []
+            elif hasattr(search_chain, "search_by_id"):
+                contexts = search_chain.search_by_id(tmdbid=tmdb_id, mtype=mtype, season=season) or []
+            else:
+                contexts = []
+            if not contexts:
+                return {
+                    "success": False,
+                    "action": "NO_RESULTS",
+                    "mode": "AUTO",
+                    "downloadedCount": 0,
+                    "downloadedTitles": [],
+                    "remainingEpisodes": missing_episodes,
+                    "message": "未检索到符合过滤规则的可用资源，建议改为订阅持续追更",
+                }
+            downloaded_list, lefts = DownloadChain().batch_download(
+                contexts=contexts,
+                no_exists=no_exists,
+                username=username,
+                source="YiYi Media",
+            )
+        except Exception:
+            return {
+                "success": False,
+                "action": "FAILED",
+                "mode": "AUTO",
+                "downloadedCount": 0,
+                "downloadedTitles": [],
+                "remainingEpisodes": missing_episodes,
+                "message": "MoviePilot 自动搜源下载执行异常，请查看 MoviePilot 日志",
+            }
+
+        titles = []
+        for ctx in downloaded_list or []:
+            torrent = getattr(ctx, "torrent_info", None)
+            t_title = self._sanitize_text(getattr(torrent, "title", "") or "", 200)
+            if t_title:
+                titles.append(t_title)
+        remaining = self._extract_remaining_episodes(lefts, tmdb_id, season)
+        if titles:
+            if remaining:
+                msg = f"已推送 {len(titles)} 个下载任务，仍有 {len(remaining)} 集未找到资源，可改用订阅继续追更"
+            else:
+                msg = f"已自动推送 {len(titles)} 个下载任务至 MoviePilot"
+            return {
+                "success": True,
+                "action": "DOWNLOADED",
+                "mode": "AUTO",
+                "downloadedCount": len(titles),
+                "downloadedTitles": titles[:20],
+                "remainingEpisodes": remaining,
+                "message": msg,
+            }
+        return {
+            "success": False,
+            "action": "NO_MATCH",
+            "mode": "AUTO",
+            "downloadedCount": 0,
+            "downloadedTitles": [],
+            "remainingEpisodes": remaining if remaining else missing_episodes,
+            "message": "已检索到候选资源但无符合缺失集或过滤优先级的项目，可改用手动选种或创建订阅",
+        }
+
+    def _search_contexts(self, mtype: Any, tmdb_id: int, season: Optional[int],
+                         missing_episodes: Optional[List[int]], total_episode: Optional[int],
+                         no_exists: Optional[dict] = None) -> List[Any]:
+        chain = SearchChain()
+        if no_exists is not None and hasattr(chain, "recognize_media") and hasattr(chain, "process"):
+            mediainfo = chain.recognize_media(mtype=mtype, tmdbid=tmdb_id)
+            if mediainfo is not None:
+                return chain.process(mediainfo=mediainfo, no_exists=no_exists) or []
+        if hasattr(chain, "search_by_id"):
+            return chain.search_by_id(tmdbid=tmdb_id, mtype=mtype, season=season) or []
+        if hasattr(chain, "recognize_media") and hasattr(chain, "process"):
+            mediainfo = chain.recognize_media(mtype=mtype, tmdbid=tmdb_id)
+            if mediainfo is not None:
+                return chain.process(mediainfo=mediainfo, no_exists=no_exists) or []
+        return []
+
+    @staticmethod
+    def _build_no_exists(media_kind: str, tmdb_id: int, season: Optional[int],
+                         missing_episodes: List[int], total_episode: Optional[int],
+                         mediainfo: Any = None) -> Optional[dict]:
+        if media_kind != "TV" or season is None:
+            return None
+        effective_total = total_episode if (total_episode and total_episode > 0) else (
+            max(missing_episodes) if missing_episodes else 0
+        )
+        start_ep = min(missing_episodes) if missing_episodes else 1
+        if NotExistMediaInfo is not None:
+            info = NotExistMediaInfo(
+                season=season,
+                episodes=list(missing_episodes),
+                total_episode=effective_total,
+                start_episode=start_ep,
+            )
+        else:  # pragma: no cover
+            from types import SimpleNamespace
+            info = SimpleNamespace(
+                season=season,
+                episodes=list(missing_episodes),
+                total_episode=effective_total,
+                start_episode=start_ep,
+            )
+        media_key: Any = tmdb_id
+        if mediainfo is not None and build_media_key is not None and resolve_media_identity is not None:
+            try:
+                src, mid = resolve_media_identity(media=mediainfo)
+                media_key = build_media_key(src, mid)
+            except Exception:
+                media_key = tmdb_id
+        return {media_key: {season: info}}
+
+    @classmethod
+    def _extract_remaining_episodes(cls, lefts: Any, tmdb_id: int, season: Optional[int]) -> List[int]:
+        if not isinstance(lefts, dict) or season is None:
+            return []
+        season_map = None
+        for candidate_key in (tmdb_id, str(tmdb_id), f"tmdb:{tmdb_id}"):
+            if candidate_key in lefts:
+                season_map = lefts[candidate_key]
+                break
+        if season_map is None and len(lefts) == 1:
+            season_map = next(iter(lefts.values()))
+        if not isinstance(season_map, dict):
+            return []
+        ne = season_map.get(season)
+        if ne is None:
+            return []
+        return cls._parse_episodes(getattr(ne, "episodes", None))
+
+    def _store_search_session(self, token: str, scope_key: tuple, media_kind: str,
+                              tmdb_id: int, season: Optional[int], candidates: Dict[str, Any]):
+        now = datetime.now(timezone.utc)
+        with self._state_lock:
+            self._prune_search_cache_locked(now)
+            while len(self._search_cache) >= MAX_SEARCH_SESSIONS:
+                oldest = next(iter(self._search_cache))
+                self._search_cache.pop(oldest, None)
+            self._search_cache[token] = {
+                "created_at": now,
+                "scope": scope_key,
+                "media_kind": media_kind,
+                "tmdb_id": tmdb_id,
+                "season": season,
+                "candidates": candidates,
+            }
+
+    def _get_search_session(self, token: str, scope_key: tuple) -> Optional[Dict[str, Any]]:
+        now = datetime.now(timezone.utc)
+        with self._state_lock:
+            self._prune_search_cache_locked(now)
+            entry = self._search_cache.get(token)
+            if entry is None or entry.get("scope") != scope_key:
+                return None
+            return entry
+
+    def _prune_search_cache_locked(self, now: datetime):
+        cutoff = now - timedelta(seconds=SEARCH_SESSION_TTL_SECONDS)
+        expired = [tok for tok, item in self._search_cache.items() if item.get("created_at", now) < cutoff]
+        for tok in expired:
+            self._search_cache.pop(tok, None)
+
+    @classmethod
+    def _parse_episodes(cls, raw: Any) -> List[int]:
+        if not raw or not isinstance(raw, (list, tuple, set)):
+            return []
+        result = set()
+        for item in raw:
+            val = cls._optional_int(item)
+            if val is not None and val > 0:
+                result.add(val)
+            if len(result) >= 500:
+                break
+        return sorted(result)
+
+    @staticmethod
+    def _sanitize_text(raw: Any, max_len: int) -> str:
+        if not isinstance(raw, str):
+            return ""
+        cleaned = re.sub(r"https?://\S+", "[url]", raw).strip()
+        return cleaned[:max_len]
+
+    @eventmanager.register([EventType.SubscribeComplete, EventType.SubscribeModified, EventType.SubscribeDeleted])
+    def on_subscribe_event(self, event: Event):
+        """监听 MoviePilot 订阅变更与完成事件并异步通知 YiYi"""
+        if not self._enabled or event is None:
+            return
+        with self._state_lock:
+            state = self.get_data(STATE_KEY) or {}
+            connection_id = state.get("connection_id")
+            yiyi_url = state.get("yiyi_url")
+            access_key = state.get("access_key")
+            tracked_map = self.get_data(SUBSCRIPTIONS_KEY) or {}
+        if not connection_id or not yiyi_url or not access_key:
+            return
+
+        event_data = getattr(event, "event_data", None) or {}
+        if not isinstance(event_data, dict):
+            return
+        sub_info = event_data.get("subscribe_info")
+        info = sub_info if isinstance(sub_info, dict) else {}
+        raw_sub_id = event_data.get("subscribe_id") or info.get("id")
+        sub_id = self._optional_int(raw_sub_id)
+        tracked = tracked_map.get(str(sub_id)) if sub_id is not None else None
+
+        tmdb_id = self._optional_int(info.get("tmdbid") or (tracked or {}).get("tmdbId"))
+        if sub_id is None and tmdb_id is None:
+            return
+
+        raw_type = str(info.get("type") or (tracked or {}).get("mediaType") or "").strip()
+        media_kind = "TV" if raw_type in ("电视剧", "TV", "Series", "tv", str(getattr(MediaType, "TV", "TV"))) else "MOVIE"
+        season = self._optional_int(info.get("season") if "season" in info else (tracked or {}).get("season"))
+
+        etype = getattr(event, "event_type", None)
+        if etype == EventType.SubscribeComplete:
+            normalized_event = "COMPLETED"
+            sub_state = "COMPLETED"
+            lack_episode = 0
+            if sub_id is not None:
+                self._forget_subscription(sub_id)
+        elif etype == EventType.SubscribeDeleted:
+            normalized_event = "DELETED"
+            sub_state = "DELETED"
+            lack_episode = self._optional_int(info.get("lack_episode"))
+            if sub_id is not None:
+                self._forget_subscription(sub_id)
+        else:
+            normalized_event = "UPDATED"
+            sub_state = str(info.get("state") or "R")
+            lack_episode = self._optional_int(info.get("lack_episode"))
+
+        body = {
+            "eventType": normalized_event,
+            "mpSubscribeId": sub_id,
+            "requestId": (tracked or {}).get("requestId"),
+            "mediaType": media_kind,
+            "tmdbId": tmdb_id,
+            "season": season if media_kind == "TV" else 0,
+            "state": sub_state,
+            "totalEpisode": self._optional_int(info.get("total_episode")),
+            "lackEpisode": lack_episode,
+        }
+        try:
+            self._request(
+                "POST",
+                f"{yiyi_url}{API_BASE}/client/{connection_id}/subscribes/events",
+                key=access_key,
+                payload=body,
+            )
+        except Exception:
+            # 事件回推失败不阻塞宿主事件总线；YiYi 对账接口可兜底同步状态。
+            pass
+
+    def _remember_subscription(self, sub_id: int, request_id: Optional[int], media_kind: str,
+                               tmdb_id: int, season: Optional[int]):
+        with self._state_lock:
+            tracked = self.get_data(SUBSCRIPTIONS_KEY) or {}
+            if len(tracked) >= MAX_TRACKED_SUBSCRIPTIONS and str(sub_id) not in tracked:
+                oldest_key = next(iter(tracked))
+                tracked.pop(oldest_key, None)
+            tracked[str(sub_id)] = {
+                "requestId": request_id,
+                "mediaType": media_kind,
+                "tmdbId": tmdb_id,
+                "season": season if media_kind == "TV" else 0,
+            }
+            self.save_data(SUBSCRIPTIONS_KEY, tracked)
+
+    def _forget_subscription(self, sub_id: int):
+        with self._state_lock:
+            tracked = self.get_data(SUBSCRIPTIONS_KEY) or {}
+            if str(sub_id) in tracked:
+                tracked.pop(str(sub_id), None)
+                self.save_data(SUBSCRIPTIONS_KEY, tracked)
+
+    @classmethod
+    def _find_existing_subscribe(cls, oper: Any, media_kind: str, tmdb_id: int, season: Optional[int]) -> Any:
+        rows = oper.list() if hasattr(oper, "list") else []
+        for item in rows or []:
+            item_tmdb = cls._optional_int(getattr(item, "tmdbid", None))
+            if item_tmdb != tmdb_id:
+                continue
+            raw_type = getattr(item, "type", None)
+            is_tv = raw_type in (
+                getattr(MediaType, "TV", None),
+                getattr(getattr(MediaType, "TV", None), "value", None),
+                "电视剧", "TV", "tv",
+            )
+            if (media_kind == "TV") != is_tv:
+                continue
+            if media_kind == "TV":
+                item_season = cls._optional_int(getattr(item, "season", None))
+                if item_season != season:
+                    continue
+            return item
+        return None
+
+    @staticmethod
+    def _positive_int(value: Any, field_name: str) -> int:
+        if isinstance(value, bool):
+            raise HTTPException(status_code=400, detail=f"{field_name} 必须是正整数")
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError) as exc:
+            raise HTTPException(status_code=400, detail=f"{field_name} 必须是正整数") from exc
+        if parsed <= 0:
+            raise HTTPException(status_code=400, detail=f"{field_name} 必须是正整数")
+        return parsed
+
+    @staticmethod
+    def _optional_int(value: Any) -> Optional[int]:
+        if value is None or isinstance(value, bool) or value == "":
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _sanitize_message(raw: Any) -> str:
+        if not isinstance(raw, str):
+            return ""
+        cleaned = re.sub(r"https?://\S+", "[url]", raw).strip()
+        if any(secret_word in cleaned.lower() for secret_word in ("token", "apikey", "api_key", "secret", "password")):
+            return "MoviePilot 处理订阅未成功，请在 MoviePilot 日志查看详情"
+        return cleaned[:240]
 
     def _validate_callback(self, authorization: Optional[tuple]):
         state = self.get_data(STATE_KEY) or {}
@@ -229,7 +952,7 @@ class YiYiMedia(_PluginBase):
         self._require_ok(response)
         data = response.json()
         connection_id = data.get("connectionId", "")
-        if not re.fullmatch(r"[a-f0-9-]{36}", connection_id) or data.get("protocolVersion") != 1:
+        if not re.fullmatch(r"[a-f0-9-]{36}", connection_id) or data.get("protocolVersion") not in (1, 2, 3):
             raise IntegrationError("不支持的配对协议")
         with self._state_lock:
             if not self._current(generation):
@@ -293,7 +1016,9 @@ class YiYiMedia(_PluginBase):
         with self._state_lock:
             self._enabled = False
             self._generation += 1
+            self._search_cache.clear()
             self.save_data(STATE_KEY, {})
+            self.save_data(SUBSCRIPTIONS_KEY, {})
             self._config.update({"enabled": False, "disconnect": False, "pairing_code": ""})
             self.update_config(self._config)
             self._disable_server()
@@ -340,7 +1065,7 @@ class YiYiMedia(_PluginBase):
                 {"component": "VAlert", "props": {
                     "type": "success" if connected else "info", "variant": "tonal", "density": "compact",
                     "class": "mb-5 rounded-lg", "title": status,
-                    "text": "媒体服务器已自动添加，每分钟检查连接。" if connected else
+                    "text": "媒体服务器与求片订阅通道均已就绪，每分钟检查连接。" if connected else
                             "首次连接：在 YiYi 生成配对码，填写下方地址和配对码，启用后保存。",
                 }},
                 {"component": "VSwitch", "props": {
@@ -377,7 +1102,7 @@ class YiYiMedia(_PluginBase):
                     ]},
                     {"component": "VAlert", "props": {
                         "type": "info", "variant": "tonal", "density": "compact", "class": "mt-3",
-                        "text": "媒体服务器名称自动读取 YiYi 的「系统名称」，修改后也会自动同步，无需填写。",
+                        "text": "媒体服务器名称自动读取 YiYi 的「系统名称」；管理员确认的求片订阅也将通过本连接自动创建。",
                     }},
                 ]}]},
                 {"component": "VExpansionPanels", "props": {"variant": "accordion"}, "content": [
@@ -406,6 +1131,7 @@ class YiYiMedia(_PluginBase):
         with self._state_lock:
             self._enabled = False
             self._generation += 1
+            self._search_cache.clear()
         if self._scheduler:
             self._scheduler.shutdown(wait=False)
             self._scheduler = None

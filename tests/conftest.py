@@ -18,10 +18,122 @@ def plugin_module(monkeypatch):
         """模拟 MoviePilot 配置枚举"""
         MediaServers = "MediaServers"
 
+    class MediaType(Enum):
+        """模拟 MoviePilot 媒体类型枚举"""
+        MOVIE = "电影"
+        TV = "电视剧"
+
     class ConfigChangeEventData:
         """保留配置事件的结构"""
         def __init__(self, **kwargs):
             self.__dict__.update(kwargs)
+
+    class Event:
+        """模拟宿主事件对象"""
+        def __init__(self, event_type, event_data=None):
+            self.event_type = event_type
+            self.event_data = event_data or {}
+
+    registered_handlers = []
+
+    def register_event(types_or_type):
+        def decorator(func):
+            registered_handlers.append((types_or_type, func))
+            return func
+        return decorator
+
+    subscribes_store = {}
+    subscribe_calls = []
+    next_sub_id = [100]
+    search_contexts = []
+    search_calls = []
+    download_single_calls = []
+    batch_download_calls = []
+
+    class NotExistMediaInfo:
+        """隔离的缺集元数据替身"""
+        def __init__(self, season=None, episodes=None, total_episode=0, start_episode=0):
+            self.season = season
+            self.episodes = list(episodes or [])
+            self.total_episode = total_episode
+            self.start_episode = start_episode
+
+    class SearchChain:
+        """隔离的资源搜索业务链替身"""
+        search_error = None
+
+        def recognize_media(self, **kwargs):
+            return SimpleNamespace(tmdb_id=kwargs.get("tmdbid"), type=kwargs.get("mtype"))
+
+        def search_by_id(self, **kwargs):
+            search_calls.append(("search_by_id", copy.deepcopy(kwargs)))
+            if self.search_error is not None:
+                raise self.search_error
+            return list(search_contexts)
+
+        def process(self, **kwargs):
+            search_calls.append(("process", kwargs))
+            if self.search_error is not None:
+                raise self.search_error
+            return list(search_contexts)
+
+    class DownloadChain:
+        """隔离的下载执行业务链替身"""
+        single_return = "hash-abc-123"
+        single_error = None
+        batch_lefts = None
+        batch_downloaded_override = None
+
+        def download_single(self, **kwargs):
+            download_single_calls.append(kwargs)
+            if self.single_error is not None:
+                raise self.single_error
+            return self.single_return
+
+        def batch_download(self, **kwargs):
+            batch_download_calls.append(kwargs)
+            downloaded = list(self.batch_downloaded_override) if self.batch_downloaded_override is not None else list(kwargs.get("contexts") or [])
+            lefts = self.batch_lefts if self.batch_lefts is not None else {}
+            return downloaded, lefts
+
+    class SubscribeOper:
+        """隔离的订阅数据库操作替身"""
+        def list(self):
+            return list(subscribes_store.values())
+
+        def get(self, sid):
+            return subscribes_store.get(int(sid))
+
+        def delete(self, sid):
+            return subscribes_store.pop(int(sid), None)
+
+    class SubscribeChain:
+        """隔离的订阅业务链替身"""
+        add_error = None
+        fail_message = None
+
+        def add(self, **kwargs):
+            subscribe_calls.append(copy.deepcopy(kwargs))
+            if self.add_error is not None:
+                raise self.add_error
+            if self.fail_message is not None:
+                return None, self.fail_message
+            sid = next_sub_id[0]
+            next_sub_id[0] += 1
+            item = SimpleNamespace(
+                id=sid,
+                type=kwargs["mtype"],
+                tmdbid=kwargs["tmdbid"],
+                season=kwargs.get("season"),
+                name=kwargs["title"],
+                year=kwargs.get("year"),
+                best_version=kwargs.get("best_version", 0),
+                state="R",
+                total_episode=12 if kwargs["mtype"] == MediaType.TV else None,
+                lack_episode=4 if kwargs["mtype"] == MediaType.TV else None,
+            )
+            subscribes_store[sid] = item
+            return sid, "订阅添加成功"
 
     class PluginBase:
         """插件持久化边界替身"""
@@ -54,14 +166,29 @@ def plugin_module(monkeypatch):
         def __init__(self, **kwargs):
             raise AssertionError("测试禁止真实网络请求")
 
+    event_types = SimpleNamespace(
+        ConfigChanged="ConfigChanged",
+        SubscribeComplete="subscribe.complete",
+        SubscribeModified="subscribe.modified",
+        SubscribeDeleted="subscribe.deleted",
+    )
+
     modules = {
-        "app": {}, "app.core": {}, "app.utils": {},
+        "app": {}, "app.core": {}, "app.utils": {}, "app.chain": {}, "app.db": {},
         "app.core.config": {"settings": SimpleNamespace(APP_DOMAIN="https://mp.example.com")},
+        "app.core.event": {"Event": Event, "eventmanager": SimpleNamespace(register=register_event)},
+        "app.chain.subscribe": {"SubscribeChain": SubscribeChain},
+        "app.chain.search": {"SearchChain": SearchChain},
+        "app.chain.download": {"DownloadChain": DownloadChain},
+        "app.db.subscribe_oper": {"SubscribeOper": SubscribeOper},
         "app.log": {"logger": SimpleNamespace(info=lambda *args: None)},
         "app.plugins": {"_PluginBase": PluginBase},
-        "app.schemas": {"ConfigChangeEventData": ConfigChangeEventData},
-        "app.schemas.types": {"SystemConfigKey": SystemConfigKey,
-                              "EventType": SimpleNamespace(ConfigChanged="ConfigChanged")},
+        "app.schemas": {"ConfigChangeEventData": ConfigChangeEventData, "NotExistMediaInfo": NotExistMediaInfo},
+        "app.schemas.types": {
+            "SystemConfigKey": SystemConfigKey,
+            "MediaType": MediaType,
+            "EventType": event_types,
+        },
         "app.utils.http": {"RequestUtils": RequestUtils},
     }
     for name, attrs in modules.items():
@@ -73,6 +200,22 @@ def plugin_module(monkeypatch):
     module = importlib.util.module_from_spec(spec)
     monkeypatch.setitem(sys.modules, spec.name, module)
     spec.loader.exec_module(module)
+    module._test_doubles = SimpleNamespace(
+        subscribes_store=subscribes_store,
+        subscribe_calls=subscribe_calls,
+        SubscribeChain=SubscribeChain,
+        SearchChain=SearchChain,
+        DownloadChain=DownloadChain,
+        NotExistMediaInfo=NotExistMediaInfo,
+        search_contexts=search_contexts,
+        search_calls=search_calls,
+        download_single_calls=download_single_calls,
+        batch_download_calls=batch_download_calls,
+        MediaType=MediaType,
+        Event=Event,
+        EventType=event_types,
+        registered_handlers=registered_handlers,
+    )
     return module
 
 
