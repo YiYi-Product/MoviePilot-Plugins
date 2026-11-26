@@ -84,6 +84,8 @@ def plugin_module(monkeypatch):
         batch_lefts = None
         batch_downloaded_override = None
         downloading_items = []
+        list_torrents_items = []
+        list_torrents_calls = []
 
         def download_single(self, **kwargs):
             download_single_calls.append(kwargs)
@@ -99,6 +101,20 @@ def plugin_module(monkeypatch):
 
         def downloading(self, name=None):
             return list(self.downloading_items)
+
+        def list_torrents(self, status=None, hashs=None, downloader=None, include_all_tags=False):
+            self.list_torrents_calls.append({
+                "status": status,
+                "hashs": list(hashs) if isinstance(hashs, list) else hashs,
+                "downloader": downloader,
+                "include_all_tags": include_all_tags,
+            })
+            if not self.list_torrents_items:
+                return []
+            if hashs:
+                wanted = {str(h).lower() for h in (hashs if isinstance(hashs, list) else [hashs])}
+                return [item for item in self.list_torrents_items if str(getattr(item, "hash", "")).lower() in wanted]
+            return list(self.list_torrents_items)
 
     history_store = {}
 

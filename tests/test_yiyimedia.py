@@ -669,3 +669,56 @@ def test_torrent_upload_download_and_query_progress_protocol_v4(plugin, plugin_m
         assert items[1]["downloader"] == "Transmission"
         assert items[2]["exists"] is False
         assert items[2]["state"] == "NOT_FOUND"
+
+
+def test_torrent_upload_preserves_builtin_tag_and_queries_all_tags(plugin, plugin_module, monkeypatch):
+    """自定义标签必须保留 settings.TORRENT_TAG，且进度查询优先用 list_torrents(include_all_tags=True)"""
+    install_request(monkeypatch, plugin)
+    plugin.synchronize()
+    auth = plugin.verify_integration_key(plugin.get_data("connection")["callback_key"])
+    monkeypatch.setattr(plugin_module.settings, "TORRENT_TAG", "MOVIEPILOT", raising=False)
+
+    sample_torrent = b"d8:announce19:https://pt.test/ann4:infod4:name12:Movie.2026.e"
+    plugin_module._test_doubles.DownloadChain.single_return = ("hash-pt-1", "")
+    res = plugin.upload_torrent_download(
+        {
+            "mediaType": "MOVIE",
+            "tmdbId": 1137844,
+            "title": "求救信号",
+            "year": 2026,
+            "torrentName": "Mayday.2026.2160p",
+            "torrentBase64": base64.b64encode(sample_torrent).decode("ascii"),
+            "label": "YiYi用户投递",
+        },
+        auth,
+    )
+    assert res["success"] is True
+    last_call = plugin_module._test_doubles.download_single_calls[-1]
+    assert last_call["label"] == "MOVIEPILOT,YiYi用户投递"
+
+    # 模拟 downloading() 为空（仅限内置标签过滤掉），但 list_torrents(include_all_tags=True) 命中真实进度
+    plugin_module._test_doubles.DownloadChain.downloading_items[:] = []
+    plugin_module._test_doubles.DownloadChain.list_torrents_items[:] = [
+        SimpleNamespace(hash="hash-pt-1", progress=27.4, state="downloading", downloader="下载器2"),
+        SimpleNamespace(hash="hash-pt-done", progress=100.0, state="completed", downloader="下载器2"),
+    ]
+    plugin_module._test_doubles.history_store["hash-pt-1"] = SimpleNamespace(downloader="下载器2")
+
+    queried = plugin.query_downloads({"hashes": ["hash-pt-1", "hash-pt-done"]}, auth)
+    assert plugin_module._test_doubles.DownloadChain.list_torrents_calls[-1]["include_all_tags"] is True
+    assert queried["items"][0] == {
+        "downloadHash": "hash-pt-1",
+        "exists": True,
+        "active": True,
+        "state": "downloading",
+        "progress": 27.4,
+        "downloader": "下载器2",
+    }
+    assert queried["items"][1] == {
+        "downloadHash": "hash-pt-done",
+        "exists": True,
+        "active": False,
+        "state": "completed",
+        "progress": 100.0,
+        "downloader": "下载器2",
+    }

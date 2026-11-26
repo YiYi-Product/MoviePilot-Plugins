@@ -652,7 +652,7 @@ class YiYiMedia(_PluginBase):
         username = str(data.get("username") or "").strip()[:64] or "YiYi Media"
         downloader = str(data.get("downloader") or "").strip()[:64] or None
         save_path = str(data.get("savePath") or "").strip()[:512] or None
-        label = str(data.get("label") or "").strip()[:64] or None
+        label = self._merge_torrent_labels(str(data.get("label") or "").strip()[:64] or None)
         total_size = int(float(data.get("totalSize") or 0)) if data.get("totalSize") not in (None, "") else 0
 
         raw_b64 = data.get("torrentBase64")
@@ -732,15 +732,18 @@ class YiYiMedia(_PluginBase):
         if not isinstance(raw_hashes, list) or len(raw_hashes) > 100:
             raise HTTPException(status_code=400, detail="hashes 必须是长度不超过 100 的数组")
 
-        active_map: Dict[str, Any] = {}
-        if DownloadChain is not None and hasattr(DownloadChain, "downloading"):
-            try:
-                for item in DownloadChain().downloading() or []:
-                    h = str(getattr(item, "hash", "") or "").strip().lower()
-                    if h:
-                        active_map[h] = item
-            except Exception:
-                pass
+        normalized_hashes: List[str] = []
+        seen_hashes = set()
+        for raw_h in raw_hashes:
+            h_str = str(raw_h or "").strip()
+            if not h_str or len(h_str) > 128:
+                continue
+            low = h_str.lower()
+            if low not in seen_hashes:
+                seen_hashes.add(low)
+                normalized_hashes.append(h_str)
+
+        active_map = self._query_live_torrents_by_hash(normalized_hashes)
 
         hist_oper = None
         if DownloadHistoryOper is not None:
@@ -749,11 +752,12 @@ class YiYiMedia(_PluginBase):
             except Exception:
                 hist_oper = None
 
+        done_states = {
+            "completed", "seeding", "uploading", "finished",
+            "stalledup", "pausedup", "queuedup", "forcedup",
+        }
         items = []
-        for raw_h in raw_hashes:
-            h_str = str(raw_h or "").strip()
-            if not h_str or len(h_str) > 128:
-                continue
+        for h_str in normalized_hashes:
             key_lower = h_str.lower()
             active = active_map.get(key_lower)
             if active is not None:
@@ -764,10 +768,11 @@ class YiYiMedia(_PluginBase):
                     progress = 0.0
                 state = self._sanitize_text(str(getattr(active, "state", "") or "downloading"), 32) or "downloading"
                 dl_name = self._sanitize_text(str(getattr(active, "downloader", "") or ""), 64) or None
+                is_active = state.lower() not in done_states and progress < 100.0
                 items.append({
                     "downloadHash": h_str,
                     "exists": True,
-                    "active": True,
+                    "active": is_active,
                     "state": state,
                     "progress": round(progress, 1),
                     "downloader": dl_name,
@@ -799,6 +804,62 @@ class YiYiMedia(_PluginBase):
                     "downloader": None,
                 })
         return {"items": items}
+
+    @staticmethod
+    def _merge_torrent_labels(label: Optional[str]) -> Optional[str]:
+        """自定义标签时一并保留 MoviePilot 内置 TORRENT_TAG，确保下载监控与自动整理正常命中"""
+        custom_tags = [part.strip() for part in str(label or "").split(",") if part.strip()]
+        if not custom_tags:
+            return None
+        default_tags = [
+            part.strip()
+            for part in str(getattr(settings, "TORRENT_TAG", "") or "").split(",")
+            if part.strip()
+        ]
+        merged: List[str] = []
+        for tag in default_tags + custom_tags:
+            if tag not in merged:
+                merged.append(tag)
+        return ",".join(merged) if merged else None
+
+    @staticmethod
+    def _query_live_torrents_by_hash(hashes: List[str]) -> Dict[str, Any]:
+        """优先按 Hash 跨所有下载器与标签实时查询种子进度，旧宿主自动回退 downloading()"""
+        result: Dict[str, Any] = {}
+        if not hashes or DownloadChain is None:
+            return result
+        try:
+            dc = DownloadChain()
+        except Exception:
+            return result
+
+        if hasattr(dc, "list_torrents"):
+            try:
+                list_fn = dc.list_torrents
+                kwargs: Dict[str, Any] = {"hashs": hashes}
+                try:
+                    params = inspect.signature(list_fn).parameters
+                    accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+                    if accepts_var_kw or "include_all_tags" in params:
+                        kwargs["include_all_tags"] = True
+                except (TypeError, ValueError):
+                    pass
+                for item in list_fn(**kwargs) or []:
+                    h = str(getattr(item, "hash", "") or "").strip().lower()
+                    if h:
+                        result[h] = item
+            except Exception:
+                pass
+
+        if len(result) < len(hashes) and hasattr(dc, "downloading"):
+            try:
+                for item in dc.downloading() or []:
+                    h = str(getattr(item, "hash", "") or "").strip().lower()
+                    if h and h not in result:
+                        result[h] = item
+            except Exception:
+                pass
+        return result
 
     @staticmethod
     def _resolve_media_info_for_torrent(mtype: Any, tmdb_id: int, title: str,
