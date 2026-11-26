@@ -83,6 +83,7 @@ def plugin_module(monkeypatch):
         single_error = None
         batch_lefts = None
         batch_downloaded_override = None
+        downloading_items = []
 
         def download_single(self, **kwargs):
             download_single_calls.append(kwargs)
@@ -95,6 +96,16 @@ def plugin_module(monkeypatch):
             downloaded = list(self.batch_downloaded_override) if self.batch_downloaded_override is not None else list(kwargs.get("contexts") or [])
             lefts = self.batch_lefts if self.batch_lefts is not None else {}
             return downloaded, lefts
+
+        def downloading(self, name=None):
+            return list(self.downloading_items)
+
+    history_store = {}
+
+    class DownloadHistoryOper:
+        """隔离的下载历史查询替身"""
+        def get_by_hash(self, download_hash):
+            return history_store.get(download_hash)
 
     class SubscribeOper:
         """隔离的订阅数据库操作替身"""
@@ -181,6 +192,7 @@ def plugin_module(monkeypatch):
         "app.chain.search": {"SearchChain": SearchChain},
         "app.chain.download": {"DownloadChain": DownloadChain},
         "app.db.subscribe_oper": {"SubscribeOper": SubscribeOper},
+        "app.db.downloadhistory_oper": {"DownloadHistoryOper": DownloadHistoryOper},
         "app.log": {"logger": SimpleNamespace(info=lambda *args: None)},
         "app.plugins": {"_PluginBase": PluginBase},
         "app.schemas": {"ConfigChangeEventData": ConfigChangeEventData, "NotExistMediaInfo": NotExistMediaInfo},
@@ -211,6 +223,7 @@ def plugin_module(monkeypatch):
         search_calls=search_calls,
         download_single_calls=download_single_calls,
         batch_download_calls=batch_download_calls,
+        history_store=history_store,
         MediaType=MediaType,
         Event=Event,
         EventType=event_types,

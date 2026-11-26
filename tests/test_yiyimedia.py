@@ -1,5 +1,6 @@
 """验证配对恢复、配置隔离、专属鉴权及撤销竞争"""
 
+import base64
 import copy
 from types import SimpleNamespace
 
@@ -322,9 +323,10 @@ def test_subscribe_endpoints_create_attach_query_and_cancel(plugin, plugin_modul
     with TestClient(app) as client:
         ping = client.get("/ping", headers={"X-YiYi-Integration-Key": key})
         assert ping.status_code == 200
-        assert ping.json()["protocolVersion"] == 3
+        assert ping.json()["protocolVersion"] == 4
         assert "subscribe" in ping.json()["capabilities"]
         assert "download" in ping.json()["capabilities"]
+        assert "torrent_upload" in ping.json()["capabilities"]
 
         assert client.post("/subscribes", json={"mediaType": "TV", "tmdbId": 1399, "title": "权力的游戏", "season": 2}).status_code == 401
 
@@ -564,3 +566,106 @@ def test_download_auto_mode_uses_batch_download_and_reports_remaining_episodes(p
     assert empty_res["success"] is False
     assert empty_res["action"] == "NO_RESULTS"
     assert empty_res["remainingEpisodes"] == [7]
+
+
+def test_torrent_upload_download_and_query_progress_protocol_v4(plugin, plugin_module, monkeypatch):
+    """协议 v4 支持接收审核后的原始种子并精准传递 TMDB ID / 季 / 集，同时支持批量查询下载进度"""
+    install_request(monkeypatch, plugin)
+    plugin.synchronize()
+    key = plugin.get_data("connection")["callback_key"]
+    sample_torrent = b"d8:announce26:https://pt.test/a?pk=sec4:infod4:name18:Show.S02E07.2160p.e"
+    b64_payload = base64.b64encode(sample_torrent).decode("ascii")
+
+    plugin_module._test_doubles.DownloadChain.single_return = ("hash-torrent-99", "")
+    plugin_module._test_doubles.DownloadChain.downloading_items[:] = [
+        SimpleNamespace(hash="hash-torrent-99", progress=62.5, state="downloading", downloader="qBittorrent")
+    ]
+    plugin_module._test_doubles.history_store["hash-done-1"] = SimpleNamespace(downloader="Transmission")
+
+    app = FastAPI()
+    for api in plugin.get_api():
+        api = dict(api)
+        api.pop("allow_anonymous")
+        app.add_api_route(**api)
+
+    with TestClient(app) as client:
+        # 拒绝未授权
+        assert client.post("/downloads/torrent", json={}).status_code == 401
+        # 拒绝非法种子字节
+        bad = client.post(
+            "/downloads/torrent",
+            headers={"X-YiYi-Integration-Key": key},
+            json={
+                "mediaType": "TV",
+                "tmdbId": 1399,
+                "title": "权力的游戏",
+                "season": 2,
+                "episodes": [7],
+                "torrentName": "bad.torrent",
+                "torrentBase64": base64.b64encode(b"not-a-torrent").decode("ascii"),
+            },
+        )
+        assert bad.status_code == 400
+
+        ok = client.post(
+            "/downloads/torrent",
+            headers={"X-YiYi-Integration-Key": key},
+            json={
+                "requestId": 12,
+                "mediaType": "TV",
+                "tmdbId": 1399,
+                "title": "权力的游戏",
+                "year": 2012,
+                "season": 2,
+                "episodes": [7, 8],
+                "torrentName": "Game.of.Thrones.S02E07-E08.2160p",
+                "torrentBase64": b64_payload,
+                "totalSize": 8_000_000_000,
+                "username": "alice",
+                "downloader": "qBittorrent",
+                "savePath": "/downloads/tv",
+                "label": "YiYi用户投递",
+            },
+        )
+        assert ok.status_code == 200
+        body = ok.json()
+        assert body["success"] is True
+        assert body["action"] == "DOWNLOADED"
+        assert body["downloadHash"] == "hash-torrent-99"
+        assert body["downloader"] == "qBittorrent"
+
+        last_call = plugin_module._test_doubles.download_single_calls[-1]
+        assert last_call["torrent_content"] == sample_torrent
+        assert last_call["episodes"] == {7, 8}
+        assert last_call["downloader"] == "qBittorrent"
+        assert last_call["save_path"] == "/downloads/tv"
+        assert last_call["label"] == "YiYi用户投递"
+        ctx = last_call["context"]
+        assert ctx.media_info.tmdb_id == 1399
+        assert ctx.meta_info.tmdbid == 1399
+        assert ctx.meta_info.begin_season == 2
+        assert ctx.meta_info.begin_episode == 7
+        assert ctx.meta_info.end_episode == 8
+
+        # 批量查询下载进度：活跃任务 + 历史已完成 + 不存在
+        queried = client.post(
+            "/downloads/query",
+            headers={"X-YiYi-Integration-Key": key},
+            json={"hashes": ["hash-torrent-99", "hash-done-1", "hash-missing"]},
+        )
+        assert queried.status_code == 200
+        items = queried.json()["items"]
+        assert items[0] == {
+            "downloadHash": "hash-torrent-99",
+            "exists": True,
+            "active": True,
+            "state": "downloading",
+            "progress": 62.5,
+            "downloader": "qBittorrent",
+        }
+        assert items[1]["exists"] is True
+        assert items[1]["active"] is False
+        assert items[1]["state"] == "FINISHED_OR_REMOVED"
+        assert items[1]["downloader"] == "Transmission"
+        assert items[2]["exists"] is False
+        assert items[2]["state"] == "NOT_FOUND"

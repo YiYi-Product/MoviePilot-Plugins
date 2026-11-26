@@ -1,13 +1,16 @@
 """YiYi Media 与 MoviePilot 的双向配对与求片订阅插件"""
 
+import base64
 import copy
 import hashlib
 import hmac
+import inspect
 import re
 import secrets
 import threading
 import uuid
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import urlsplit, urlunsplit
 
@@ -34,6 +37,28 @@ except ImportError:  # pragma: no cover - 兼容精简宿主环境
     DownloadChain = None
 
 try:
+    from app.chain.media import MediaChain
+except ImportError:  # pragma: no cover - 兼容精简宿主环境
+    MediaChain = None
+
+try:
+    from app.core.context import Context, MediaInfo, TorrentInfo
+except ImportError:  # pragma: no cover - 兼容精简宿主环境
+    Context = None
+    MediaInfo = None
+    TorrentInfo = None
+
+try:
+    from app.core.metainfo import MetaInfo
+except ImportError:  # pragma: no cover - 兼容精简宿主环境
+    MetaInfo = None
+
+try:
+    from app.db.downloadhistory_oper import DownloadHistoryOper
+except ImportError:  # pragma: no cover - 兼容精简宿主环境
+    DownloadHistoryOper = None
+
+try:
     from app.schemas import NotExistMediaInfo
 except ImportError:  # pragma: no cover - 兼容旧版 schemas 导出路径
     try:
@@ -55,12 +80,13 @@ except ImportError:  # pragma: no cover - 兼容不同 MoviePilot 宿主模块�
 API_BASE = "/api/media/integrations/moviepilot"
 STATE_KEY = "connection"
 SUBSCRIPTIONS_KEY = "subscriptions"
-PROTOCOL_VERSION = 3
-CAPABILITIES = ["media_server", "subscribe", "download"]
+PROTOCOL_VERSION = 4
+CAPABILITIES = ["media_server", "subscribe", "download", "torrent_upload"]
 MAX_TRACKED_SUBSCRIPTIONS = 2000
 MAX_SEARCH_SESSIONS = 32
 SEARCH_SESSION_TTL_SECONDS = 900
 MAX_SEARCH_RESULTS = 100
+MAX_TORRENT_UPLOAD_BYTES = 10 * 1024 * 1024
 
 
 class IntegrationError(ValueError):
@@ -68,12 +94,12 @@ class IntegrationError(ValueError):
 
 
 class YiYiMedia(_PluginBase):
-    """管理独立集成凭据、插件创建的媒体服务器与求片订阅/缺集补全下载联动，不改动其它服务器"""
+    """管理独立集成凭据、插件创建的媒体服务器与求片订阅/缺集直接下载/用户种子投递联动，不改动其它服务器"""
 
     plugin_name = "YiYi Media"
-    plugin_desc = "双向配对授权、自动添加 YiYi Media 媒体服务器并联动处理求片订阅与缺集直接下载。"
+    plugin_desc = "双向配对授权、自动添加 YiYi Media 媒体服务器并联动处理求片订阅、缺集直连下载与审核种子投递。"
     plugin_icon = "Emby_A.png"
-    plugin_version = "1.2.0"
+    plugin_version = "1.3.0"
     plugin_author = "YiYi-Product"
     author_url = "https://github.com/YiYi-Product"
     plugin_config_prefix = "yiyimedia_"
@@ -153,6 +179,16 @@ class YiYiMedia(_PluginBase):
             """触发 MoviePilot 直接下载（支持 AUTO 自动优选补全与 SELECTED 手动选种下载）"""
             return self.trigger_download(payload, authorization)
 
+        def upload_torrent_download_callback(payload: Dict[str, Any] = Body(...),
+                                             authorization=Depends(self.verify_integration_key)):
+            """接收 YiYi 管理员审核通过的用户种子文件，按指定 TMDB ID 与季/集推送 MoviePilot 下载"""
+            return self.upload_torrent_download(payload, authorization)
+
+        def query_downloads_callback(payload: Dict[str, Any] = Body(...),
+                                     authorization=Depends(self.verify_integration_key)):
+            """按下载任务 hash 批量查询 MoviePilot 下载进度与状态"""
+            return self.query_downloads(payload, authorization)
+
         return [
             {"path": "/ping", "endpoint": ping_callback, "methods": ["GET"],
              "summary": "YiYi 双向连通验证", "allow_anonymous": True},
@@ -168,6 +204,10 @@ class YiYiMedia(_PluginBase):
              "summary": "YiYi 检索可下载候选资源", "allow_anonymous": True},
             {"path": "/downloads", "endpoint": trigger_download_callback, "methods": ["POST"],
              "summary": "YiYi 直接触发 MoviePilot 下载", "allow_anonymous": True},
+            {"path": "/downloads/torrent", "endpoint": upload_torrent_download_callback, "methods": ["POST"],
+             "summary": "YiYi 投递已审核种子文件至 MoviePilot 下载", "allow_anonymous": True},
+            {"path": "/downloads/query", "endpoint": query_downloads_callback, "methods": ["POST"],
+             "summary": "YiYi 批量查询种子下载任务状态", "allow_anonymous": True},
         ]
 
     def verify_integration_key(self, key: Optional[str] = Header(default=None, alias="X-YiYi-Integration-Key")):
@@ -580,6 +620,344 @@ class YiYiMedia(_PluginBase):
             "message": "已检索到候选资源但无符合缺失集或过滤优先级的项目，可改用手动选种或创建订阅",
         }
 
+    def upload_torrent_download(self, payload: Optional[Dict[str, Any]], authorization: Optional[tuple] = None) -> dict:
+        """接收 YiYi 审核通过的原始种子内容，绑定精准 TMDB ID 与季/集信息后交由 DownloadChain 下发下载器"""
+        with self._state_lock:
+            self._validate_callback(authorization)
+        if DownloadChain is None:
+            return {
+                "success": False,
+                "action": "UNSUPPORTED",
+                "downloadHash": None,
+                "downloader": None,
+                "message": "当前 MoviePilot 运行环境不支持直接下载链",
+            }
+
+        data = payload if isinstance(payload, dict) else {}
+        media_kind = str(data.get("mediaType") or "").strip().upper()
+        if media_kind not in ("MOVIE", "TV"):
+            raise HTTPException(status_code=400, detail="不支持的媒体类型")
+        tmdb_id = self._positive_int(data.get("tmdbId"), "tmdbId")
+        title = str(data.get("title") or "").strip()
+        if not title or len(title) > 512:
+            raise HTTPException(status_code=400, detail="媒体标题无效")
+        season = self._positive_int(data.get("season"), "season") if media_kind == "TV" else None
+        episodes = self._parse_episodes(data.get("episodes")) if media_kind == "TV" else []
+        year_val = data.get("year")
+        year = str(year_val).strip() if year_val not in (None, "") else ""
+        if year and not re.fullmatch(r"[0-9]{4}", year):
+            year = ""
+        imdb_id = str(data.get("imdbId") or "").strip()[:32] or None
+        torrent_name = self._sanitize_text(data.get("torrentName") or data.get("torrentFileName") or title, 300) or title
+        username = str(data.get("username") or "").strip()[:64] or "YiYi Media"
+        downloader = str(data.get("downloader") or "").strip()[:64] or None
+        save_path = str(data.get("savePath") or "").strip()[:512] or None
+        label = str(data.get("label") or "").strip()[:64] or None
+        total_size = int(float(data.get("totalSize") or 0)) if data.get("totalSize") not in (None, "") else 0
+
+        raw_b64 = data.get("torrentBase64")
+        if not isinstance(raw_b64, str) or not raw_b64.strip():
+            raise HTTPException(status_code=400, detail="缺少种子文件内容")
+        if len(raw_b64) > int(MAX_TORRENT_UPLOAD_BYTES * 1.4) + 1024:
+            raise HTTPException(status_code=400, detail="种子文件体积超出限制（最大 10 MB）")
+        try:
+            torrent_bytes = base64.b64decode(raw_b64.strip(), validate=True)
+        except Exception as exc:
+            raise HTTPException(status_code=400, detail="种子文件 Base64 编码无效") from exc
+        if not torrent_bytes or len(torrent_bytes) > MAX_TORRENT_UPLOAD_BYTES or not torrent_bytes.startswith(b"d"):
+            raise HTTPException(status_code=400, detail="种子文件格式无效，仅支持标准 BitTorrent (.torrent) 文件")
+
+        mtype = MediaType.TV if media_kind == "TV" else MediaType.MOVIE
+        mediainfo = self._resolve_media_info_for_torrent(mtype, tmdb_id, title, year, imdb_id)
+        meta = self._build_meta_for_torrent(torrent_name, mtype, tmdb_id, season, episodes, year)
+        torrent_info = self._build_torrent_info(torrent_name, tmdb_id, total_size)
+        ctx = self._build_context(meta, mediainfo, torrent_info)
+        ep_set = set(episodes) if (media_kind == "TV" and episodes) else None
+
+        try:
+            download_chain = DownloadChain()
+            call_kwargs = self._build_download_single_kwargs(
+                download_chain.download_single,
+                context=ctx,
+                torrent_content=torrent_bytes,
+                episodes=ep_set,
+                username=username,
+                source="YiYi Media",
+                downloader=downloader,
+                save_path=save_path,
+                label=label,
+            )
+            raw_did = download_chain.download_single(**call_kwargs)
+        except Exception:
+            return {
+                "success": False,
+                "action": "FAILED",
+                "downloadHash": None,
+                "downloader": downloader,
+                "message": "MoviePilot 提交种子下载任务失败，请检查下载器、下载目录配置与 MoviePilot 日志",
+            }
+
+        did = raw_did[0] if isinstance(raw_did, tuple) else raw_did
+        err_detail = raw_did[1] if (isinstance(raw_did, tuple) and len(raw_did) > 1) else ""
+        if did:
+            resolved_downloader = downloader
+            if not resolved_downloader and DownloadHistoryOper is not None:
+                try:
+                    hist = DownloadHistoryOper().get_by_hash(str(did))
+                    if hist is not None and getattr(hist, "downloader", None):
+                        resolved_downloader = str(getattr(hist, "downloader"))[:64]
+                except Exception:
+                    pass
+            return {
+                "success": True,
+                "action": "DOWNLOADED",
+                "downloadHash": str(did).strip()[:128],
+                "downloader": resolved_downloader,
+                "message": f"已推送种子至 MoviePilot 下载：{torrent_name}",
+            }
+        return {
+            "success": False,
+            "action": "FAILED",
+            "downloadHash": None,
+            "downloader": downloader,
+            "message": self._sanitize_message(err_detail) or "MoviePilot 未能添加该种子下载任务（可能已存在或下载器拒绝）",
+        }
+
+    def query_downloads(self, payload: Optional[Dict[str, Any]], authorization: Optional[tuple] = None) -> dict:
+        """批量查询种子下载任务的实时进度与下载器状态"""
+        with self._state_lock:
+            self._validate_callback(authorization)
+        data = payload if isinstance(payload, dict) else {}
+        raw_hashes = data.get("hashes")
+        if not isinstance(raw_hashes, list) or len(raw_hashes) > 100:
+            raise HTTPException(status_code=400, detail="hashes 必须是长度不超过 100 的数组")
+
+        active_map: Dict[str, Any] = {}
+        if DownloadChain is not None and hasattr(DownloadChain, "downloading"):
+            try:
+                for item in DownloadChain().downloading() or []:
+                    h = str(getattr(item, "hash", "") or "").strip().lower()
+                    if h:
+                        active_map[h] = item
+            except Exception:
+                pass
+
+        hist_oper = None
+        if DownloadHistoryOper is not None:
+            try:
+                hist_oper = DownloadHistoryOper()
+            except Exception:
+                hist_oper = None
+
+        items = []
+        for raw_h in raw_hashes:
+            h_str = str(raw_h or "").strip()
+            if not h_str or len(h_str) > 128:
+                continue
+            key_lower = h_str.lower()
+            active = active_map.get(key_lower)
+            if active is not None:
+                raw_prog = getattr(active, "progress", 0.0)
+                try:
+                    progress = max(0.0, min(100.0, float(raw_prog or 0.0)))
+                except (TypeError, ValueError):
+                    progress = 0.0
+                state = self._sanitize_text(str(getattr(active, "state", "") or "downloading"), 32) or "downloading"
+                dl_name = self._sanitize_text(str(getattr(active, "downloader", "") or ""), 64) or None
+                items.append({
+                    "downloadHash": h_str,
+                    "exists": True,
+                    "active": True,
+                    "state": state,
+                    "progress": round(progress, 1),
+                    "downloader": dl_name,
+                })
+                continue
+
+            hist = None
+            if hist_oper is not None and hasattr(hist_oper, "get_by_hash"):
+                try:
+                    hist = hist_oper.get_by_hash(h_str)
+                except Exception:
+                    hist = None
+            if hist is not None:
+                items.append({
+                    "downloadHash": h_str,
+                    "exists": True,
+                    "active": False,
+                    "state": "FINISHED_OR_REMOVED",
+                    "progress": 100.0,
+                    "downloader": self._sanitize_text(str(getattr(hist, "downloader", "") or ""), 64) or None,
+                })
+            else:
+                items.append({
+                    "downloadHash": h_str,
+                    "exists": False,
+                    "active": False,
+                    "state": "NOT_FOUND",
+                    "progress": None,
+                    "downloader": None,
+                })
+        return {"items": items}
+
+    @staticmethod
+    def _resolve_media_info_for_torrent(mtype: Any, tmdb_id: int, title: str,
+                                        year: str, imdb_id: Optional[str]) -> Any:
+        mediainfo = None
+        for chain_cls in (MediaChain, SearchChain):
+            if chain_cls is None:
+                continue
+            try:
+                chain = chain_cls()
+                if hasattr(chain, "recognize_media"):
+                    mediainfo = chain.recognize_media(mtype=mtype, tmdbid=tmdb_id)
+                    if mediainfo is not None:
+                        break
+            except Exception:
+                continue
+        if mediainfo is not None:
+            try:
+                mediainfo.tmdb_id = tmdb_id
+                mediainfo.type = mtype
+            except Exception:
+                pass
+            return mediainfo
+
+        if MediaInfo is not None:
+            try:
+                fallback = MediaInfo()
+                fallback.type = mtype
+                fallback.tmdb_id = tmdb_id
+                fallback.title = title
+                fallback.year = year or None
+                fallback.imdb_id = imdb_id
+                return fallback
+            except Exception:
+                pass
+        return SimpleNamespace(
+            type=mtype,
+            tmdb_id=tmdb_id,
+            title=title,
+            year=year or None,
+            imdb_id=imdb_id,
+            category=None,
+            title_year=f"{title} ({year})" if year else title,
+        )
+
+    @staticmethod
+    def _build_meta_for_torrent(torrent_name: str, mtype: Any, tmdb_id: int,
+                                season: Optional[int], episodes: List[int], year: str) -> Any:
+        if MetaInfo is not None:
+            try:
+                meta = MetaInfo(title=torrent_name)
+            except Exception:
+                meta = None
+        else:
+            meta = None
+
+        if meta is None:
+            season_str = f"S{season:02d}" if season else ""
+            ep_str = ""
+            if episodes:
+                ep_str = f"E{min(episodes):02d}" if len(episodes) == 1 else f"E{min(episodes):02d}-E{max(episodes):02d}"
+            meta = SimpleNamespace(
+                org_string=torrent_name,
+                title=torrent_name,
+                type=mtype,
+                year=year or None,
+                tmdbid=tmdb_id,
+                begin_season=season,
+                end_season=None,
+                begin_episode=min(episodes) if episodes else None,
+                end_episode=max(episodes) if len(episodes) > 1 else None,
+                episode_list=list(episodes),
+                season=season_str,
+                episode=ep_str,
+                season_episode=f"{season_str}{ep_str}",
+            )
+            return meta
+
+        for attr, val in (
+            ("type", mtype),
+            ("tmdbid", tmdb_id),
+            ("year", year or getattr(meta, "year", None)),
+        ):
+            try:
+                setattr(meta, attr, val)
+            except Exception:
+                pass
+        if mtype == MediaType.TV:
+            try:
+                meta.begin_season = season
+                meta.end_season = None
+                if episodes:
+                    meta.begin_episode = min(episodes)
+                    meta.end_episode = max(episodes) if len(episodes) > 1 else None
+                else:
+                    meta.begin_episode = None
+                    meta.end_episode = None
+            except Exception:
+                pass
+        else:
+            try:
+                meta.begin_season = None
+                meta.end_season = None
+                meta.begin_episode = None
+                meta.end_episode = None
+            except Exception:
+                pass
+        return meta
+
+    @staticmethod
+    def _build_torrent_info(torrent_name: str, tmdb_id: int, total_size: int) -> Any:
+        if TorrentInfo is not None:
+            try:
+                return TorrentInfo(
+                    site_name="YiYi用户投递",
+                    title=torrent_name,
+                    description=f"YiYi 用户上传种子 (TMDB:{tmdb_id})",
+                    size=float(max(0, total_size)),
+                    enclosure="",
+                )
+            except Exception:
+                pass
+        return SimpleNamespace(
+            site_name="YiYi用户投递",
+            site_cookie=None,
+            site_downloader=None,
+            title=torrent_name,
+            description=f"YiYi 用户上传种子 (TMDB:{tmdb_id})",
+            size=float(max(0, total_size)),
+            enclosure="",
+        )
+
+    @staticmethod
+    def _build_context(meta: Any, mediainfo: Any, torrent_info: Any) -> Any:
+        if Context is not None:
+            try:
+                return Context(meta_info=meta, media_info=mediainfo, torrent_info=torrent_info)
+            except Exception:
+                pass
+        return SimpleNamespace(meta_info=meta, media_info=mediainfo, torrent_info=torrent_info)
+
+    @staticmethod
+    def _build_download_single_kwargs(func: Any, **candidates: Any) -> Dict[str, Any]:
+        """按宿主 MoviePilot 版本动态过滤可选参数，兼容新旧版 DownloadChain.download_single"""
+        desired = {**candidates, "return_detail": True}
+        try:
+            sig = inspect.signature(func)
+        except (TypeError, ValueError):
+            return {k: v for k, v in candidates.items() if v is not None or k in ("context", "torrent_content", "episodes")}
+        params = sig.parameters
+        accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        if accepts_var_kw:
+            return {k: v for k, v in desired.items() if v is not None or k in ("context", "torrent_content", "episodes")}
+        out: Dict[str, Any] = {}
+        for k, v in desired.items():
+            if k in params and (v is not None or k in ("context", "torrent_content", "episodes")):
+                out[k] = v
+        return out
+
     def _search_contexts(self, mtype: Any, tmdb_id: int, season: Optional[int],
                          missing_episodes: Optional[List[int]], total_episode: Optional[int],
                          no_exists: Optional[dict] = None) -> List[Any]:
@@ -952,7 +1330,7 @@ class YiYiMedia(_PluginBase):
         self._require_ok(response)
         data = response.json()
         connection_id = data.get("connectionId", "")
-        if not re.fullmatch(r"[a-f0-9-]{36}", connection_id) or data.get("protocolVersion") not in (1, 2, 3):
+        if not re.fullmatch(r"[a-f0-9-]{36}", connection_id) or data.get("protocolVersion") not in (1, 2, 3, 4):
             raise IntegrationError("不支持的配对协议")
         with self._state_lock:
             if not self._current(generation):
