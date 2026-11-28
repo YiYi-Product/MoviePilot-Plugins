@@ -1,6 +1,9 @@
 # YiYi MoviePilot 插件
 
-面向 MoviePilot v2 的 YiYi Media 集成插件。插件通过一次性配对码建立双向授权，自动添加一个 Emby 类型的 YiYi Media 媒体服务器。
+面向 MoviePilot v2 / v3 的 YiYi Media 集成插件。插件通过一次性配对码建立双向授权，自动添加一个 Emby 类型的 YiYi Media 媒体服务器。
+
+- MoviePilot v3（`>=3.0.0`）自动使用 `package.v3.json` / `plugins.v3/yiyimedia/`（原生 V3 SDK 与统一媒体身份 `media_source` / `media_id`）。
+- MoviePilot v2 继续使用 `package.v2.json` / `plugins.v2/yiyimedia/`，并已同步内置跨版本兼容回退逻辑。
 
 ## 配置
 

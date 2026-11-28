@@ -722,3 +722,274 @@ def test_torrent_upload_preserves_builtin_tag_and_queries_all_tags(plugin, plugi
         "progress": 100.0,
         "downloader": "下载器2",
     }
+
+
+@pytest.mark.parametrize("plugin_path", [
+    "plugins.v3/yiyimedia/__init__.py",
+    "plugins.v2/yiyimedia/__init__.py",
+])
+def test_v3_host_subscribe_uses_unified_identity_dedupes_and_handles_pydantic_events(
+    load_v3_host_plugin, monkeypatch, plugin_path
+):
+    """严格 V3 宿主下：订阅写入使用 media_source/media_id（不触发 SubscriptionPatch 未知字段），去重忽略非 TMDB 来源，事件兼容 Pydantic 模型"""
+    module, plugin = load_v3_host_plugin(plugin_path)
+    doubles = module._test_doubles
+    calls = install_request(monkeypatch, plugin)
+    plugin.synchronize()
+    auth = plugin.verify_integration_key(plugin.get_data("connection")["callback_key"])
+
+    # 预置同数值但属于豆瓣来源的订阅，不应被误判为同 TMDB 订阅
+    doubles.subscribes_store[1] = SimpleNamespace(
+        id=1, type="电视剧", media_source="douban", media_id="298546", season=1, state="R"
+    )
+
+    created = plugin.create_subscribe(
+        {
+            "requestId": 101,
+            "mediaType": "TV",
+            "tmdbId": 298546,
+            "title": "新手上路",
+            "year": 2025,
+            "season": 1,
+            "bestVersion": True,
+            "username": "alice",
+        },
+        auth,
+    )
+    assert created["success"] is True
+    assert created["action"] == "CREATED"
+    sub_id = created["mpSubscribeId"]
+    assert len(doubles.subscribe_calls) == 1
+    first_call = doubles.subscribe_calls[0]
+    assert first_call["media_source"] == doubles.MediaSource.TMDB
+    assert first_call["media_id"] == "298546"
+    assert "tmdbid" not in first_call["kwargs"]
+    assert "tmdb_id" not in first_call["kwargs"]
+    assert first_call["kwargs"]["best_version"] == 1
+
+    # 再次推送同一 TMDB 剧集同季，应命中 V3 的 media_source/media_id 幂等挂载
+    attached = plugin.create_subscribe(
+        {"requestId": 102, "mediaType": "TV", "tmdbId": 298546, "title": "新手上路", "season": 1},
+        auth,
+    )
+    assert attached["success"] is True
+    assert attached["action"] == "ATTACHED"
+    assert attached["mpSubscribeId"] == sub_id
+    assert len(doubles.subscribe_calls) == 1
+
+    # V3 订阅完成事件可能传递 Pydantic BaseEventData（带 model_dump），且 subscribe_info 仅含 media_source/media_id
+    class FakeV3EventData:
+        def model_dump(self):
+            return {
+                "subscribe_id": sub_id,
+                "subscribe_info": {
+                    "id": sub_id,
+                    "media_source": "themoviedb",
+                    "media_id": "298546",
+                    "type": "电视剧",
+                    "season": 1,
+                    "total_episode": 12,
+                },
+                "mediainfo": {
+                    "media_source": "themoviedb",
+                    "media_id": "298546",
+                    "tmdb_id": 298546,
+                    "type": "电视剧",
+                },
+            }
+
+    calls.clear()
+    plugin.on_subscribe_event(doubles.Event(doubles.EventType.SubscribeComplete, FakeV3EventData()))
+    assert len(calls) == 1
+    _, url, _, payload = calls[0]
+    assert url.endswith(f"/client/{CONNECTION_ID}/subscribes/events")
+    assert payload == {
+        "eventType": "COMPLETED",
+        "mpSubscribeId": sub_id,
+        "requestId": 102,
+        "mediaType": "TV",
+        "tmdbId": 298546,
+        "season": 1,
+        "state": "COMPLETED",
+        "totalEpisode": 12,
+        "lackEpisode": 0,
+    }
+
+    # 未在本地跟踪表中的 V3 订阅事件，也能直接从 subscribe_info.media_source / media_id 提取 tmdbId
+    calls.clear()
+    plugin.on_subscribe_event(
+        doubles.Event(
+            doubles.EventType.SubscribeModified,
+            {
+                "subscribe_id": 999,
+                "subscribe_info": {
+                    "id": 999,
+                    "media_source": "themoviedb",
+                    "media_id": "1399",
+                    "type": "电视剧",
+                    "season": 2,
+                    "state": "R",
+                    "total_episode": 10,
+                    "lack_episode": 3,
+                },
+            },
+        )
+    )
+    assert len(calls) == 1
+    assert calls[0][3] == {
+        "eventType": "UPDATED",
+        "mpSubscribeId": 999,
+        "requestId": None,
+        "mediaType": "TV",
+        "tmdbId": 1399,
+        "season": 2,
+        "state": "R",
+        "totalEpisode": 10,
+        "lackEpisode": 3,
+    }
+
+
+@pytest.mark.parametrize("plugin_path", [
+    "plugins.v3/yiyimedia/__init__.py",
+    "plugins.v2/yiyimedia/__init__.py",
+])
+def test_v3_host_search_auto_download_and_torrent_upload_use_unified_identity(
+    load_v3_host_plugin, monkeypatch, plugin_path
+):
+    """严格 V3 宿主下：检索、AUTO 自动下载与用户种子投递均使用 media_source/media_id 及 tmdb:<id> 缺集键"""
+    module, plugin = load_v3_host_plugin(plugin_path)
+    doubles = module._test_doubles
+    install_request(monkeypatch, plugin)
+    plugin.synchronize()
+    auth = plugin.verify_integration_key(plugin.get_data("connection")["callback_key"])
+
+    ctx = SimpleNamespace(
+        torrent_info=SimpleNamespace(
+            site_name="MTeam", title="Show.S02E03.2160p", description="ep3",
+            size=4_000_000_000, seeders=30, peers=2, grabs=10,
+            pubdate="2026-11-28", volume_factor="免费", hit_and_run=False, labels=[], pri_order=20,
+        ),
+        meta_info=SimpleNamespace(
+            season_list=[2], episode_list=[3], season_episode="S02E03",
+            resource_pix="2160p", edition="WEB-DL", video_encode="H265", audio_encode="AAC", resource_team="TEAM",
+        ),
+    )
+    doubles.search_contexts[:] = [ctx]
+
+    # 1. 手动检索：严格 V3 search_by_id(media_source=TMDB, media_id="1399")
+    searched = plugin.search_downloads({"mediaType": "TV", "tmdbId": 1399, "season": 2, "episodes": [3]}, auth)
+    assert searched["success"] is True
+    assert searched["totalCount"] == 1
+    assert doubles.search_calls[-1] == ("search_by_id", {
+        "media_source": doubles.MediaSource.TMDB,
+        "media_id": "1399",
+        "mtype": doubles.MediaType.TV,
+        "season": 2,
+    })
+
+    # 2. AUTO 补全：recognize_media 使用 V3 统一身份，no_exists 与 lefts 键为 tmdb:1399
+    doubles.DownloadChain.batch_downloaded_override = [ctx]
+    doubles.DownloadChain.batch_lefts = {
+        "tmdb:1399": {2: doubles.NotExistMediaInfo(season=2, episodes=[7], total_episode=10, start_episode=3)}
+    }
+    auto_res = plugin.trigger_download(
+        {"mode": "AUTO", "mediaType": "TV", "tmdbId": 1399, "title": "权力的游戏", "season": 2, "episodes": [3, 7], "totalEpisode": 10},
+        auth,
+    )
+    assert auto_res["success"] is True
+    assert auto_res["remainingEpisodes"] == [7]
+    assert doubles.recognize_calls[-1] == ("SearchChain", {
+        "mtype": doubles.MediaType.TV,
+        "media_source": doubles.MediaSource.TMDB,
+        "media_id": "1399",
+    })
+    assert "tmdb:1399" in doubles.batch_download_calls[-1]["no_exists"]
+    assert doubles.batch_download_calls[-1]["no_exists"]["tmdb:1399"][2].episodes == [3, 7]
+
+    # 3. 审核种子投递：识别失败回退构造 MediaInfo 时也带齐 V3 media_source / media_id
+    doubles.MediaChain.return_none = True
+    monkeypatch.setattr(doubles.SearchChain, "recognize_media", lambda self, **kw: None)
+    sample_torrent = b"d8:announce19:https://pt.test/ann4:infod4:name12:Show.S02E07.e"
+    up_res = plugin.upload_torrent_download(
+        {
+            "mediaType": "TV",
+            "tmdbId": 1399,
+            "title": "权力的游戏",
+            "year": 2012,
+            "season": 2,
+            "episodes": [7],
+            "torrentName": "Show.S02E07.2160p",
+            "torrentBase64": base64.b64encode(sample_torrent).decode("ascii"),
+            "label": "YiYi用户投递",
+        },
+        auth,
+    )
+    assert up_res["success"] is True
+    last_dl = doubles.download_single_calls[-1]
+    assert last_dl["label"] == "MOVIEPILOT,YiYi用户投递"
+    assert last_dl["context"].media_info.media_source == doubles.MediaSource.TMDB
+    assert last_dl["context"].media_info.media_id == "1399"
+    assert last_dl["context"].media_info.tmdb_id == 1399
+    assert last_dl["context"].meta_info.media_source == doubles.MediaSource.TMDB
+    assert last_dl["context"].meta_info.media_id == "1399"
+    assert last_dl["context"].torrent_info.media_source == doubles.MediaSource.TMDB
+    assert last_dl["context"].torrent_info.media_id == "1399"
+
+
+def test_subscribe_fallback_recovers_when_host_rejects_identity_kwargs(load_v3_host_plugin, monkeypatch):
+    """若异构宿主拒绝身份参数并返回“订阅分类设置无效”或未知字段错误，自动回退按标题/年份/季写入"""
+    module, plugin = load_v3_host_plugin("plugins.v2/yiyimedia/__init__.py")
+    doubles = module._test_doubles
+    install_request(monkeypatch, plugin)
+    plugin.synchronize()
+    auth = plugin.verify_integration_key(plugin.get_data("connection")["callback_key"])
+
+    seen = []
+
+    def strict_fork_add(self, title, year, mtype=None, season=None, best_version=0, exist_ok=False, username=None, **kwargs):
+        seen.append(dict(kwargs))
+        if kwargs:
+            # 模拟拒绝所有额外身份字段并返回通用分类错误
+            return None, "订阅分类设置无效，请重新选择分类后重试"
+        item = SimpleNamespace(
+            id=305, type="电视剧", media_source="themoviedb", media_id="298546",
+            season=season, name=title, state="R", total_episode=16, lack_episode=16,
+        )
+        doubles.subscribes_store[305] = item
+        return 305, "新增订阅成功"
+
+    monkeypatch.setattr(doubles.SubscribeChain, "add", strict_fork_add)
+    res = plugin.create_subscribe(
+        {"requestId": 201, "mediaType": "TV", "tmdbId": 298546, "title": "那年那兔那些事儿", "year": 2015, "season": 1},
+        auth,
+    )
+    assert res["success"] is True
+    assert res["action"] == "CREATED"
+    assert res["mpSubscribeId"] == 305
+    assert seen[0] == {"media_source": doubles.MediaSource.TMDB, "media_id": "298546"}
+    assert seen[1] == {}
+
+
+def test_package_indexes_match_plugin_versions():
+    """package.v2.json / package.v3.json 元数据与对应插件代码版本及历史置顶规则严格一致"""
+    import json
+    import re
+    from pathlib import Path
+
+    root = Path(__file__).parents[1]
+    pkg_v2 = json.loads((root / "package.v2.json").read_text(encoding="utf-8"))["YiYiMedia"]
+    pkg_v3 = json.loads((root / "package.v3.json").read_text(encoding="utf-8"))["YiYiMedia"]
+
+    v2_src = (root / "plugins.v2/yiyimedia/__init__.py").read_text(encoding="utf-8")
+    v3_src = (root / "plugins.v3/yiyimedia/__init__.py").read_text(encoding="utf-8")
+
+    v2_ver = re.search(r'plugin_version\s*=\s*"([^"]+)"', v2_src).group(1)
+    v3_ver = re.search(r'plugin_version\s*=\s*"([^"]+)"', v3_src).group(1)
+
+    assert pkg_v2["version"] == v2_ver
+    assert pkg_v2["v3"] is False
+    assert next(iter(pkg_v2["history"])) == f"v{v2_ver}"
+
+    assert pkg_v3["version"] == v3_ver
+    assert pkg_v3["system_version"] == ">=3.0.0"
+    assert next(iter(pkg_v3["history"])) == f"v{v3_ver}"

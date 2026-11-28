@@ -54,9 +54,17 @@ except ImportError:  # pragma: no cover - 兼容精简宿主环境
     MetaInfo = None
 
 try:
+    from app.schemas.types import MediaSource
+except ImportError:  # pragma: no cover - 兼容旧版 MoviePilot v2
+    MediaSource = None
+
+try:
     from app.db.downloadhistory_oper import DownloadHistoryOper
-except ImportError:  # pragma: no cover - 兼容精简宿主环境
-    DownloadHistoryOper = None
+except ImportError:  # pragma: no cover - 兼容不同 MoviePilot 宿主模块路径
+    try:
+        from app.db.oper.downloadhistory import DownloadHistoryOper
+    except ImportError:
+        DownloadHistoryOper = None
 
 try:
     from app.schemas import NotExistMediaInfo
@@ -67,10 +75,13 @@ except ImportError:  # pragma: no cover - 兼容旧版 schemas 导出路径
         NotExistMediaInfo = None
 
 try:
-    from app.utils.media import build_media_key, resolve_media_identity
+    from app.sdk.media import build_media_key, resolve_media_identity
 except ImportError:  # pragma: no cover - 兼容旧版 MoviePilot v2（键为 int tmdbid）
-    build_media_key = None
-    resolve_media_identity = None
+    try:
+        from app.utils.media import build_media_key, resolve_media_identity
+    except ImportError:
+        build_media_key = None
+        resolve_media_identity = None
 
 try:
     from app.db.subscribe_oper import SubscribeOper
@@ -99,7 +110,7 @@ class YiYiMedia(_PluginBase):
     plugin_name = "YiYi Media"
     plugin_desc = "双向配对授权、自动添加 YiYi Media 媒体服务器并联动处理求片订阅、缺集直连下载与审核种子投递。"
     plugin_icon = "Emby_A.png"
-    plugin_version = "1.3.0"
+    plugin_version = "1.3.1"
     plugin_author = "YiYi-Product"
     author_url = "https://github.com/YiYi-Product"
     plugin_config_prefix = "yiyimedia_"
@@ -240,6 +251,219 @@ class YiYiMedia(_PluginBase):
             self._clear_binding("双方授权已解除")
             return {"success": True}
 
+    @staticmethod
+    def _tmdb_media_source() -> Any:
+        """返回 TMDB 媒体来源枚举（V3）或规范字符串值"""
+        return getattr(MediaSource, "TMDB", None) if MediaSource is not None else "themoviedb"
+
+    @staticmethod
+    def _is_tmdb_source(source: Any) -> bool:
+        """判断媒体来源标识是否表示 TMDB"""
+        if source is None:
+            return False
+        raw = getattr(source, "value", source)
+        return str(raw).strip().lower() in ("themoviedb", "tmdb")
+
+    @classmethod
+    def _extract_tmdb_id(cls, obj: Any) -> Optional[int]:
+        """兼容 V3 统一媒体身份（media_source/media_id）与 V2/辅助字段提取 TMDB ID"""
+        if obj is None:
+            return None
+        if isinstance(obj, dict):
+            media_source = obj.get("media_source")
+            media_id = obj.get("media_id")
+            if media_source is not None or media_id is not None:
+                if cls._is_tmdb_source(media_source):
+                    parsed = cls._optional_int(media_id)
+                    if parsed and parsed > 0:
+                        return parsed
+            for key in ("tmdbid", "tmdb_id", "tmdbId"):
+                parsed = cls._optional_int(obj.get(key))
+                if parsed and parsed > 0:
+                    return parsed
+            return None
+
+        media_source = getattr(obj, "media_source", None)
+        media_id = getattr(obj, "media_id", None)
+        if media_source is not None or media_id is not None:
+            if cls._is_tmdb_source(media_source):
+                parsed = cls._optional_int(media_id)
+                if parsed and parsed > 0:
+                    return parsed
+        for attr in ("tmdbid", "tmdb_id", "tmdbId"):
+            parsed = cls._optional_int(getattr(obj, attr, None))
+            if parsed and parsed > 0:
+                return parsed
+        return None
+
+    @staticmethod
+    def _as_mapping(raw: Any) -> Dict[str, Any]:
+        """兼容字典与 MoviePilot V3 Pydantic 事件模型"""
+        if raw is None:
+            return {}
+        if isinstance(raw, dict):
+            return raw
+        for attr in ("model_dump", "dict"):
+            fn = getattr(raw, attr, None)
+            if callable(fn):
+                try:
+                    dumped = fn()
+                    if isinstance(dumped, dict):
+                        return dumped
+                except Exception:
+                    pass
+        return {}
+
+    @staticmethod
+    def _is_subscribe_identity_compat_error(raw: Any) -> bool:
+        """判断添加订阅失败是否可能由宿主版本间的身份参数或字段白名单差异导致"""
+        text = str(raw or "").lower()
+        if not text:
+            return False
+        if "订阅分类设置无效" in text or "unexpected keyword" in text:
+            return True
+        if "未知字段" in text or "unknown field" in text:
+            return True
+        return any(tok in text for tok in ("media_source", "media_id", "tmdbid", "tmdb_id"))
+
+    def _add_subscribe(self, mtype: Any, title: str, year: str, tmdb_id: int,
+                       season: Optional[int], best_version: int, username: str) -> Tuple[Any, Any]:
+        """兼容 MoviePilot V3（media_source/media_id）、V2（tmdbid）及异构宿主的订阅写入"""
+        add_fn = SubscribeChain().add
+        base: Dict[str, Any] = {
+            "mtype": mtype,
+            "title": title,
+            "year": year,
+            "season": season,
+            "best_version": best_version,
+            "exist_ok": True,
+            "username": username,
+        }
+        v3_identity: Dict[str, Any] = {
+            "media_source": self._tmdb_media_source(),
+            "media_id": str(tmdb_id),
+        }
+        v2_identity: Dict[str, Any] = {"tmdbid": tmdb_id}
+
+        attempts: List[Dict[str, Any]] = []
+        try:
+            params = inspect.signature(add_fn).parameters
+            has_v3 = "media_source" in params and "media_id" in params
+            has_v2 = "tmdbid" in params
+            has_tmdb_id = "tmdb_id" in params
+            accepts_var_kw = any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        except (TypeError, ValueError):
+            has_v3 = MediaSource is not None
+            has_v2 = MediaSource is None
+            has_tmdb_id = False
+            accepts_var_kw = True
+
+        if has_v3:
+            # MoviePilot V3 统一媒体身份：精确传 media_source/media_id，避免 tmdbid 落入 SubscriptionPatch 触发未知字段错误
+            attempts.extend([v3_identity, {}])
+        elif has_v2:
+            # MoviePilot V2 原生签名
+            attempts.extend([v2_identity, {}])
+        elif has_tmdb_id:
+            attempts.extend([{"tmdb_id": tmdb_id}, {}])
+        elif accepts_var_kw:
+            if MediaSource is not None:
+                attempts.extend([v3_identity, {}, v2_identity])
+            else:
+                attempts.extend([v2_identity, v3_identity, {}])
+        else:
+            attempts.append({})
+
+        last_err: Any = ""
+        for idx, identity in enumerate(attempts):
+            is_last = idx == len(attempts) - 1
+            try:
+                sid, err_msg = add_fn(**base, **identity)
+            except TypeError as exc:
+                last_err = str(exc)
+                if is_last:
+                    raise
+                continue
+            except ValueError as exc:
+                last_err = str(exc)
+                if is_last or not self._is_subscribe_identity_compat_error(last_err):
+                    raise
+                continue
+            if sid:
+                return sid, err_msg
+            last_err = err_msg
+            if is_last or not self._is_subscribe_identity_compat_error(err_msg):
+                break
+        return None, last_err
+
+    @classmethod
+    def _recognize_media_by_tmdb(cls, chain: Any, mtype: Any, tmdb_id: int) -> Any:
+        """兼容 MoviePilot V3（media_source/media_id）与 V2（tmdbid）的媒体识别调用"""
+        recognize_fn = getattr(chain, "recognize_media", None)
+        if not callable(recognize_fn):
+            return None
+        try:
+            params = inspect.signature(recognize_fn).parameters
+            has_v3 = "media_source" in params and "media_id" in params
+            has_v2 = "tmdbid" in params
+        except (TypeError, ValueError):
+            has_v3 = MediaSource is not None
+            has_v2 = not has_v3
+
+        if has_v3:
+            return recognize_fn(
+                mtype=mtype,
+                media_source=cls._tmdb_media_source(),
+                media_id=str(tmdb_id),
+            )
+        if has_v2:
+            return recognize_fn(mtype=mtype, tmdbid=tmdb_id)
+        if MediaSource is not None:
+            try:
+                return recognize_fn(
+                    mtype=mtype,
+                    media_source=cls._tmdb_media_source(),
+                    media_id=str(tmdb_id),
+                )
+            except TypeError:
+                return recognize_fn(mtype=mtype, tmdbid=tmdb_id)
+        return recognize_fn(mtype=mtype, tmdbid=tmdb_id)
+
+    @classmethod
+    def _search_by_tmdb(cls, chain: Any, mtype: Any, tmdb_id: int, season: Optional[int]) -> List[Any]:
+        """兼容 MoviePilot V3（media_source/media_id）与 V2（tmdbid）的按 ID 资源检索"""
+        search_fn = getattr(chain, "search_by_id", None)
+        if not callable(search_fn):
+            return []
+        try:
+            params = inspect.signature(search_fn).parameters
+            has_v3 = "media_source" in params and "media_id" in params
+            has_v2 = "tmdbid" in params
+        except (TypeError, ValueError):
+            has_v3 = MediaSource is not None
+            has_v2 = not has_v3
+
+        if has_v3:
+            return search_fn(
+                media_source=cls._tmdb_media_source(),
+                media_id=str(tmdb_id),
+                mtype=mtype,
+                season=season,
+            ) or []
+        if has_v2:
+            return search_fn(tmdbid=tmdb_id, mtype=mtype, season=season) or []
+        if MediaSource is not None:
+            try:
+                return search_fn(
+                    media_source=cls._tmdb_media_source(),
+                    media_id=str(tmdb_id),
+                    mtype=mtype,
+                    season=season,
+                ) or []
+            except TypeError:
+                return search_fn(tmdbid=tmdb_id, mtype=mtype, season=season) or []
+        return search_fn(tmdbid=tmdb_id, mtype=mtype, season=season) or []
+
     def create_subscribe(self, payload: Optional[Dict[str, Any]], authorization: Optional[tuple] = None) -> dict:
         """通过 MoviePilot SubscribeChain 创建订阅；若同片同季已存在则直接幂等挂载"""
         with self._state_lock:
@@ -279,14 +503,13 @@ class YiYiMedia(_PluginBase):
 
         mtype = MediaType.TV if media_kind == "TV" else MediaType.MOVIE
         try:
-            sid, err_msg = SubscribeChain().add(
+            sid, err_msg = self._add_subscribe(
                 mtype=mtype,
                 title=title,
                 year=year,
-                tmdbid=tmdb_id,
+                tmdb_id=tmdb_id,
                 season=season,
                 best_version=best_version,
-                exist_ok=True,
                 username=username,
             )
         except Exception:
@@ -554,12 +777,14 @@ class YiYiMedia(_PluginBase):
 
         try:
             search_chain = SearchChain()
-            mediainfo = search_chain.recognize_media(mtype=mtype, tmdbid=tmdb_id) if hasattr(search_chain, "recognize_media") else None
+            mediainfo = self._recognize_media_by_tmdb(search_chain, mtype, tmdb_id)
+            if mediainfo is None and MediaChain is not None:
+                mediainfo = self._recognize_media_by_tmdb(MediaChain(), mtype, tmdb_id)
             no_exists = self._build_no_exists(media_kind, tmdb_id, season, missing_episodes, total_episode, mediainfo=mediainfo)
             if mediainfo is not None and hasattr(search_chain, "process"):
                 contexts = search_chain.process(mediainfo=mediainfo, no_exists=no_exists) or []
             elif hasattr(search_chain, "search_by_id"):
-                contexts = search_chain.search_by_id(tmdbid=tmdb_id, mtype=mtype, season=season) or []
+                contexts = self._search_by_tmdb(search_chain, mtype, tmdb_id, season)
             else:
                 contexts = []
             if not contexts:
@@ -861,8 +1086,8 @@ class YiYiMedia(_PluginBase):
                 pass
         return result
 
-    @staticmethod
-    def _resolve_media_info_for_torrent(mtype: Any, tmdb_id: int, title: str,
+    @classmethod
+    def _resolve_media_info_for_torrent(cls, mtype: Any, tmdb_id: int, title: str,
                                         year: str, imdb_id: Optional[str]) -> Any:
         mediainfo = None
         for chain_cls in (MediaChain, SearchChain):
@@ -870,33 +1095,48 @@ class YiYiMedia(_PluginBase):
                 continue
             try:
                 chain = chain_cls()
-                if hasattr(chain, "recognize_media"):
-                    mediainfo = chain.recognize_media(mtype=mtype, tmdbid=tmdb_id)
-                    if mediainfo is not None:
-                        break
+                mediainfo = cls._recognize_media_by_tmdb(chain, mtype, tmdb_id)
+                if mediainfo is not None:
+                    break
             except Exception:
                 continue
+        tmdb_source = cls._tmdb_media_source()
         if mediainfo is not None:
-            try:
-                mediainfo.tmdb_id = tmdb_id
-                mediainfo.type = mtype
-            except Exception:
-                pass
+            for attr, val in (
+                ("tmdb_id", tmdb_id),
+                ("type", mtype),
+                ("media_source", tmdb_source),
+                ("media_id", str(tmdb_id)),
+            ):
+                try:
+                    setattr(mediainfo, attr, val)
+                except Exception:
+                    pass
             return mediainfo
 
         if MediaInfo is not None:
             try:
                 fallback = MediaInfo()
-                fallback.type = mtype
-                fallback.tmdb_id = tmdb_id
-                fallback.title = title
-                fallback.year = year or None
-                fallback.imdb_id = imdb_id
+                for attr, val in (
+                    ("type", mtype),
+                    ("media_source", tmdb_source),
+                    ("media_id", str(tmdb_id)),
+                    ("tmdb_id", tmdb_id),
+                    ("title", title),
+                    ("year", year or None),
+                    ("imdb_id", imdb_id),
+                ):
+                    try:
+                        setattr(fallback, attr, val)
+                    except Exception:
+                        pass
                 return fallback
             except Exception:
                 pass
         return SimpleNamespace(
             type=mtype,
+            media_source=tmdb_source,
+            media_id=str(tmdb_id),
             tmdb_id=tmdb_id,
             title=title,
             year=year or None,
@@ -905,9 +1145,10 @@ class YiYiMedia(_PluginBase):
             title_year=f"{title} ({year})" if year else title,
         )
 
-    @staticmethod
-    def _build_meta_for_torrent(torrent_name: str, mtype: Any, tmdb_id: int,
+    @classmethod
+    def _build_meta_for_torrent(cls, torrent_name: str, mtype: Any, tmdb_id: int,
                                 season: Optional[int], episodes: List[int], year: str) -> Any:
+        tmdb_source = cls._tmdb_media_source()
         if MetaInfo is not None:
             try:
                 meta = MetaInfo(title=torrent_name)
@@ -926,6 +1167,8 @@ class YiYiMedia(_PluginBase):
                 title=torrent_name,
                 type=mtype,
                 year=year or None,
+                media_source=tmdb_source,
+                media_id=str(tmdb_id),
                 tmdbid=tmdb_id,
                 begin_season=season,
                 end_season=None,
@@ -940,6 +1183,8 @@ class YiYiMedia(_PluginBase):
 
         for attr, val in (
             ("type", mtype),
+            ("media_source", tmdb_source),
+            ("media_id", str(tmdb_id)),
             ("tmdbid", tmdb_id),
             ("year", year or getattr(meta, "year", None)),
         ):
@@ -969,23 +1214,32 @@ class YiYiMedia(_PluginBase):
                 pass
         return meta
 
-    @staticmethod
-    def _build_torrent_info(torrent_name: str, tmdb_id: int, total_size: int) -> Any:
+    @classmethod
+    def _build_torrent_info(cls, torrent_name: str, tmdb_id: int, total_size: int) -> Any:
+        tmdb_source = cls._tmdb_media_source()
         if TorrentInfo is not None:
             try:
-                return TorrentInfo(
+                info = TorrentInfo(
                     site_name="YiYi用户投递",
                     title=torrent_name,
                     description=f"YiYi 用户上传种子 (TMDB:{tmdb_id})",
                     size=float(max(0, total_size)),
                     enclosure="",
                 )
+                for attr, val in (("media_source", tmdb_source), ("media_id", str(tmdb_id))):
+                    try:
+                        setattr(info, attr, val)
+                    except Exception:
+                        pass
+                return info
             except Exception:
                 pass
         return SimpleNamespace(
             site_name="YiYi用户投递",
             site_cookie=None,
             site_downloader=None,
+            media_source=tmdb_source,
+            media_id=str(tmdb_id),
             title=torrent_name,
             description=f"YiYi 用户上传种子 (TMDB:{tmdb_id})",
             size=float(max(0, total_size)),
@@ -1023,20 +1277,24 @@ class YiYiMedia(_PluginBase):
                          missing_episodes: Optional[List[int]], total_episode: Optional[int],
                          no_exists: Optional[dict] = None) -> List[Any]:
         chain = SearchChain()
-        if no_exists is not None and hasattr(chain, "recognize_media") and hasattr(chain, "process"):
-            mediainfo = chain.recognize_media(mtype=mtype, tmdbid=tmdb_id)
+        if no_exists is not None and hasattr(chain, "process"):
+            mediainfo = self._recognize_media_by_tmdb(chain, mtype, tmdb_id)
+            if mediainfo is None and MediaChain is not None:
+                mediainfo = self._recognize_media_by_tmdb(MediaChain(), mtype, tmdb_id)
             if mediainfo is not None:
                 return chain.process(mediainfo=mediainfo, no_exists=no_exists) or []
         if hasattr(chain, "search_by_id"):
-            return chain.search_by_id(tmdbid=tmdb_id, mtype=mtype, season=season) or []
-        if hasattr(chain, "recognize_media") and hasattr(chain, "process"):
-            mediainfo = chain.recognize_media(mtype=mtype, tmdbid=tmdb_id)
+            return self._search_by_tmdb(chain, mtype, tmdb_id, season)
+        if hasattr(chain, "process"):
+            mediainfo = self._recognize_media_by_tmdb(chain, mtype, tmdb_id)
+            if mediainfo is None and MediaChain is not None:
+                mediainfo = self._recognize_media_by_tmdb(MediaChain(), mtype, tmdb_id)
             if mediainfo is not None:
                 return chain.process(mediainfo=mediainfo, no_exists=no_exists) or []
         return []
 
-    @staticmethod
-    def _build_no_exists(media_kind: str, tmdb_id: int, season: Optional[int],
+    @classmethod
+    def _build_no_exists(cls, media_kind: str, tmdb_id: int, season: Optional[int],
                          missing_episodes: List[int], total_episode: Optional[int],
                          mediainfo: Any = None) -> Optional[dict]:
         if media_kind != "TV" or season is None:
@@ -1061,10 +1319,17 @@ class YiYiMedia(_PluginBase):
                 start_episode=start_ep,
             )
         media_key: Any = tmdb_id
-        if mediainfo is not None and build_media_key is not None and resolve_media_identity is not None:
+        if build_media_key is not None and resolve_media_identity is not None:
             try:
-                src, mid = resolve_media_identity(media=mediainfo)
-                media_key = build_media_key(src, mid)
+                src, mid = resolve_media_identity(media=mediainfo) if mediainfo is not None else (None, None)
+                if not src or not mid:
+                    src, mid = resolve_media_identity(
+                        media_source=cls._tmdb_media_source(),
+                        media_id=str(tmdb_id),
+                    )
+                built = build_media_key(src, mid) if src and mid else ""
+                if built:
+                    media_key = built
             except Exception:
                 media_key = tmdb_id
         return {media_key: {season: info}}
@@ -1074,7 +1339,16 @@ class YiYiMedia(_PluginBase):
         if not isinstance(lefts, dict) or season is None:
             return []
         season_map = None
-        for candidate_key in (tmdb_id, str(tmdb_id), f"tmdb:{tmdb_id}"):
+        candidate_keys: List[Any] = []
+        if build_media_key is not None:
+            try:
+                built = build_media_key(cls._tmdb_media_source(), str(tmdb_id))
+                if built:
+                    candidate_keys.append(built)
+            except Exception:
+                pass
+        candidate_keys.extend([tmdb_id, str(tmdb_id), f"tmdb:{tmdb_id}", f"themoviedb:{tmdb_id}"])
+        for candidate_key in candidate_keys:
             if candidate_key in lefts:
                 season_map = lefts[candidate_key]
                 break
@@ -1153,31 +1427,39 @@ class YiYiMedia(_PluginBase):
         if not connection_id or not yiyi_url or not access_key:
             return
 
-        event_data = getattr(event, "event_data", None) or {}
-        if not isinstance(event_data, dict):
+        event_data = self._as_mapping(getattr(event, "event_data", None))
+        if not event_data:
             return
-        sub_info = event_data.get("subscribe_info")
-        info = sub_info if isinstance(sub_info, dict) else {}
+        info = self._as_mapping(event_data.get("subscribe_info"))
+        mediainfo = self._as_mapping(event_data.get("mediainfo"))
         raw_sub_id = event_data.get("subscribe_id") or info.get("id")
         sub_id = self._optional_int(raw_sub_id)
         tracked = tracked_map.get(str(sub_id)) if sub_id is not None else None
 
-        tmdb_id = self._optional_int(info.get("tmdbid") or (tracked or {}).get("tmdbId"))
+        tmdb_id = (
+            self._extract_tmdb_id(info)
+            or self._extract_tmdb_id(mediainfo)
+            or self._optional_int((tracked or {}).get("tmdbId"))
+        )
         if sub_id is None and tmdb_id is None:
             return
 
-        raw_type = str(info.get("type") or (tracked or {}).get("mediaType") or "").strip()
+        raw_type_obj = info.get("type") or mediainfo.get("type") or (tracked or {}).get("mediaType") or ""
+        raw_type = str(getattr(raw_type_obj, "value", raw_type_obj)).strip()
         media_kind = "TV" if raw_type in ("电视剧", "TV", "Series", "tv", str(getattr(MediaType, "TV", "TV"))) else "MOVIE"
         season = self._optional_int(info.get("season") if "season" in info else (tracked or {}).get("season"))
 
         etype = getattr(event, "event_type", None)
-        if etype == EventType.SubscribeComplete:
+        etype_val = getattr(etype, "value", etype)
+        complete_val = getattr(EventType.SubscribeComplete, "value", EventType.SubscribeComplete)
+        deleted_val = getattr(EventType.SubscribeDeleted, "value", EventType.SubscribeDeleted)
+        if etype == EventType.SubscribeComplete or etype_val == complete_val:
             normalized_event = "COMPLETED"
             sub_state = "COMPLETED"
             lack_episode = 0
             if sub_id is not None:
                 self._forget_subscription(sub_id)
-        elif etype == EventType.SubscribeDeleted:
+        elif etype == EventType.SubscribeDeleted or etype_val == deleted_val:
             normalized_event = "DELETED"
             sub_state = "DELETED"
             lack_episode = self._optional_int(info.get("lack_episode"))
@@ -1236,7 +1518,7 @@ class YiYiMedia(_PluginBase):
     def _find_existing_subscribe(cls, oper: Any, media_kind: str, tmdb_id: int, season: Optional[int]) -> Any:
         rows = oper.list() if hasattr(oper, "list") else []
         for item in rows or []:
-            item_tmdb = cls._optional_int(getattr(item, "tmdbid", None))
+            item_tmdb = cls._extract_tmdb_id(item)
             if item_tmdb != tmdb_id:
                 continue
             raw_type = getattr(item, "type", None)
